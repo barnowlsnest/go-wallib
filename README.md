@@ -1,4 +1,4 @@
-# go-wal
+# go-wallib
 
 A production-ready Write-Ahead Log library for Go: append-only, durable, and
 crash-safe, with monotonic Log Sequence Numbers, CRC32C-checksummed records,
