@@ -31,6 +31,8 @@ func payloadForLSN(lsn uint64) []byte {
 
 // appendSequential writes count records and returns the WAL.
 func (s *ReaderSuite) appendSequential(count int, opts ...Option) *WAL {
+	s.T().Helper()
+
 	w, _, err := Open(s.dir, append([]Option{WithSyncPolicy(SyncImmediate)}, opts...)...)
 	s.Require().NoError(err)
 
@@ -43,6 +45,8 @@ func (s *ReaderSuite) appendSequential(count int, opts ...Option) *WAL {
 }
 
 func (s *ReaderSuite) collect(reader *Reader) []Entry {
+	s.T().Helper()
+
 	var entries []Entry
 	for reader.Next() {
 		entry := reader.Entry()

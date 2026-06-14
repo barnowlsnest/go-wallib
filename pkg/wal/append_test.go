@@ -31,6 +31,8 @@ func (s *AppendSuite) SetupTest() {
 }
 
 func (s *AppendSuite) open(opts ...Option) *WAL {
+	s.T().Helper()
+
 	w, _, err := Open(s.dir, opts...)
 	s.Require().NoError(err)
 

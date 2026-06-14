@@ -33,6 +33,8 @@ func (s *WALSuite) SetupTest() {
 // seedSegment writes a segment with the given base LSN and payloads directly via
 // the segment layer, simulating a log left behind by a previous process.
 func (s *WALSuite) seedSegment(baseLSN uint64, payloads ...[]byte) {
+	s.T().Helper()
+
 	root, err := os.OpenRoot(s.dir)
 	s.Require().NoError(err)
 	defer func() { s.Require().NoError(root.Close()) }()

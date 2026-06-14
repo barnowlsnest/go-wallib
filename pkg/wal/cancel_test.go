@@ -23,6 +23,8 @@ func (s *CancelSuite) SetupTest() {
 }
 
 func (s *CancelSuite) open() *WAL {
+	s.T().Helper()
+
 	w, _, err := Open(s.dir, WithSyncPolicy(SyncImmediate))
 	s.Require().NoError(err)
 

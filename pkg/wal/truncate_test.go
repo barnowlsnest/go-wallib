@@ -25,6 +25,8 @@ func (s *TruncateSuite) SetupTest() {
 // enough that every appended record rolls into its own segment, giving precise
 // control over segment boundaries.
 func (s *TruncateSuite) openWithOneRecordPerSegment() *WAL {
+	s.T().Helper()
+
 	w, _, err := Open(s.dir, WithSyncPolicy(SyncImmediate), WithMaxSegmentSize(40))
 	s.Require().NoError(err)
 
@@ -32,6 +34,8 @@ func (s *TruncateSuite) openWithOneRecordPerSegment() *WAL {
 }
 
 func (s *TruncateSuite) appendN(w *WAL, count int) {
+	s.T().Helper()
+
 	for i := 1; i <= count; i++ {
 		_, err := w.Append(context.Background(), payloadForLSN(uint64(i)))
 		s.Require().NoError(err)

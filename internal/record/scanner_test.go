@@ -18,6 +18,8 @@ func TestScannerSuite(t *testing.T) {
 
 // encodeRecords encodes a slice of Records into one buffer, asserting NoError.
 func (s *ScannerSuite) encodeRecords(records []Record) []byte {
+	s.T().Helper()
+
 	var buf []byte
 	for _, rec := range records {
 		var err error
