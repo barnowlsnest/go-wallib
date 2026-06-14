@@ -57,6 +57,9 @@ linters:
         - style
     gocyclo:
       min-complexity: 15
+    govet:
+      enable:
+        - fieldalignment
     lll:
       line-length: 140
     misspell:
@@ -76,6 +79,10 @@ linters:
           - gocyclo
           - gosec
         path: _test\.go
+      - linters:
+          - govet
+        path: _test\.go
+        text: fieldalignment
       - linters:
           - lll
         source: '^//go:generate '

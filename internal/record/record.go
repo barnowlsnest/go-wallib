@@ -30,10 +30,11 @@ var ErrPayloadTooLarge = errors.New("wal/record: payload exceeds MaxPayloadSize"
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
-// Record is a decoded log record.
+// Record is a decoded log record. Fields are ordered to minimize struct padding
+// and GC-scanned pointer bytes (slice first, then the scalar LSN).
 type Record struct {
-	LSN     uint64
 	Payload []byte
+	LSN     uint64
 }
 
 // EncodedSize returns the on-disk byte size of a record carrying a payload of

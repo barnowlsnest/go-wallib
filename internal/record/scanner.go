@@ -26,21 +26,22 @@ var ErrTooLarge = errors.New("wal/record: record length exceeds maximum")
 // a clean end-of-stream from a torn write or data corruption.
 //
 // Payload returned by Record() is valid only until the next call to Next().
+// Fields are ordered to minimize struct padding and GC-scanned pointer bytes:
+// pointer-bearing fields (interfaces, slices, the Record's slice) are grouped
+// first, followed by the scalar counters.
 type Scanner struct {
-	source      io.Reader
-	maxRecBytes int
-
-	// current holds the most-recently decoded record.
-	current Record
+	source   io.Reader
+	firstErr error
 	// payloadBuf is reused across calls to avoid per-record allocations.
 	payloadBuf []byte
+	// current holds the most-recently decoded record.
+	current Record
 
+	maxRecBytes int
 	// validBytes is the sum of HeaderSize+Length for all fully-valid records seen
 	// so far. It does NOT advance on error, so it always names the last good
 	// truncation point in the segment.
 	validBytes int64
-
-	firstErr error
 }
 
 // NewScanner returns a Scanner that reads from source and rejects any record
