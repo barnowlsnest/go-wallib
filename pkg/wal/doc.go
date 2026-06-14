@@ -11,6 +11,4 @@
 // Records are framed with a CRC32C checksum and stored in size-rolled segment
 // files. A single writer goroutine (the Singular Update Queue) serializes and
 // batches writes. Durability is configurable via SyncPolicy.
-//
-// See the design spec at docs/superpowers/specs/2026-06-14-go-wal-design.md.
 package wal
