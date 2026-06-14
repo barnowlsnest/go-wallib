@@ -2,6 +2,7 @@ package wal
 
 import (
 	"context"
+	"time"
 
 	"github.com/barnowlsnest/go-wal/internal/record"
 	"github.com/barnowlsnest/go-wal/internal/segment"
@@ -68,12 +69,15 @@ func (w *WAL) startWriter() {
 }
 
 // writerLoop is the body of the single writer goroutine: it serializes all
-// appends and, on Close, drains any queued requests before a final flush.
+// appends and flushes and, on Close, drains queued requests before a final
+// flush.
 func (w *WAL) writerLoop() {
 	for {
 		select {
 		case request := <-w.requestCh:
-			w.commit(request)
+			w.commit(w.gather(request))
+		case responseCh := <-w.controlCh:
+			responseCh <- w.syncActive()
 		case <-w.closed:
 			w.drain()
 			w.finalFlush()
@@ -83,7 +87,50 @@ func (w *WAL) writerLoop() {
 	}
 }
 
-// drain processes any appends that were handed off before Close was observed.
+// gather coalesces a group commit: the triggering request plus any others that
+// are (or, for SyncBatched, soon become) available, up to batchSize.
+func (w *WAL) gather(first *appendRequest) []*appendRequest {
+	batch := []*appendRequest{first}
+
+	if w.opts.syncPolicy == SyncBatched && w.opts.batchTimeout > 0 {
+		return w.gatherUntilTimeout(batch)
+	}
+
+	return w.gatherNonBlocking(batch)
+}
+
+// gatherUntilTimeout lingers up to batchTimeout to accumulate a fuller batch.
+func (w *WAL) gatherUntilTimeout(batch []*appendRequest) []*appendRequest {
+	timer := time.NewTimer(w.opts.batchTimeout)
+	defer timer.Stop()
+
+	for len(batch) < w.opts.batchSize {
+		select {
+		case request := <-w.requestCh:
+			batch = append(batch, request)
+		case <-timer.C:
+			return batch
+		}
+	}
+
+	return batch
+}
+
+// gatherNonBlocking takes only the requests already queued, without waiting.
+func (w *WAL) gatherNonBlocking(batch []*appendRequest) []*appendRequest {
+	for len(batch) < w.opts.batchSize {
+		select {
+		case request := <-w.requestCh:
+			batch = append(batch, request)
+		default:
+			return batch
+		}
+	}
+
+	return batch
+}
+
+// drain processes appends handed off before Close was observed.
 //
 // This is not a busy loop: Close sets isClosed under closeMu before signaling
 // w.closed, and enqueue holds closeMu.RLock across its isClosed check and its
@@ -93,45 +140,88 @@ func (w *WAL) drain() {
 	for {
 		select {
 		case request := <-w.requestCh:
-			w.commit(request)
+			w.commit(w.gatherNonBlocking([]*appendRequest{request}))
 		default:
 			return
 		}
 	}
 }
 
-// commit writes one append request, fsyncs per policy, and delivers the result.
-// It runs only on the writer goroutine.
-func (w *WAL) commit(request *appendRequest) {
-	if err := request.ctx.Err(); err != nil {
-		request.resultCh <- appendResult{err: err}
+// commit writes a batch of append requests, fsyncs once per the active policy,
+// and delivers each request's result. It runs only on the writer goroutine.
+func (w *WAL) commit(batch []*appendRequest) {
+	results := make([]appendResult, len(batch))
+	wroteAny := false
+
+	for i, request := range batch {
+		if err := request.ctx.Err(); err != nil {
+			results[i] = appendResult{err: err}
+
+			continue
+		}
+
+		assignedLSNs, err := w.writeRequest(request)
+		if err != nil {
+			results[i] = appendResult{err: err}
+
+			continue
+		}
+
+		results[i] = appendResult{assignedLSNs: assignedLSNs}
+		wroteAny = true
+	}
+
+	if wroteAny {
+		w.finishBatch(results)
+	}
+
+	for i, request := range batch {
+		request.resultCh <- results[i]
+	}
+}
+
+// finishBatch fsyncs the group commit (unless the interval flusher owns
+// durability) and publishes the new bounds. If the fsync fails the durability
+// guarantee is broken, so the error replaces the success result of every request
+// that had written.
+func (w *WAL) finishBatch(results []appendResult) {
+	if err := w.flushAfterCommit(); err != nil {
+		for i := range results {
+			if results[i].err == nil {
+				results[i] = appendResult{err: err}
+			}
+		}
 
 		return
 	}
 
+	w.publishLastLSN()
+}
+
+// flushAfterCommit fsyncs the active segment unless SyncInterval defers that to
+// the background flusher.
+func (w *WAL) flushAfterCommit() error {
+	if w.opts.syncPolicy == SyncInterval {
+		return nil
+	}
+
+	return w.active.Sync()
+}
+
+// writeRequest appends every payload in one request, assigning gapless LSNs.
+func (w *WAL) writeRequest(request *appendRequest) ([]uint64, error) {
 	assignedLSNs := make([]uint64, 0, len(request.payloads))
 	for _, payload := range request.payloads {
 		lsn := w.nextLSN
 		if err := w.writeRecord(lsn, payload); err != nil {
-			request.resultCh <- appendResult{err: err}
-
-			return
+			return nil, err
 		}
 
 		w.nextLSN++
 		assignedLSNs = append(assignedLSNs, lsn)
 	}
 
-	if w.opts.syncPolicy != SyncInterval {
-		if err := w.active.Sync(); err != nil {
-			request.resultCh <- appendResult{err: err}
-
-			return
-		}
-	}
-
-	w.publishLastLSN()
-	request.resultCh <- appendResult{assignedLSNs: assignedLSNs}
+	return assignedLSNs, nil
 }
 
 // writeRecord applies the segment-roll rule, then appends one record to the
@@ -181,6 +271,15 @@ func (w *WAL) publishLastLSN() {
 	}
 }
 
+// syncActive fsyncs the active segment, used by Sync and the interval flusher.
+func (w *WAL) syncActive() error {
+	if w.active == nil {
+		return nil
+	}
+
+	return w.active.Sync()
+}
+
 // finalFlush fsyncs the active segment during shutdown, logging any failure.
 func (w *WAL) finalFlush() {
 	if w.active == nil {
@@ -192,6 +291,35 @@ func (w *WAL) finalFlush() {
 	}
 }
 
-// startFlusher launches the periodic background fsync goroutine for
-// SyncInterval. It is expanded in Task 11.
-func (w *WAL) startFlusher() {}
+// startFlusher launches the periodic background fsync goroutine for SyncInterval.
+func (w *WAL) startFlusher() {
+	w.wg.Go(w.flushLoop)
+}
+
+// flushLoop periodically asks the writer goroutine to fsync, until Close.
+func (w *WAL) flushLoop() {
+	ticker := time.NewTicker(w.opts.flushInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			w.requestIntervalFlush()
+		case <-w.closed:
+			return
+		}
+	}
+}
+
+// requestIntervalFlush asks the writer goroutine for a flush, giving up if the
+// WAL closes before the request is accepted.
+func (w *WAL) requestIntervalFlush() {
+	done := make(chan error, 1)
+	select {
+	case w.controlCh <- done:
+		if err := <-done; err != nil {
+			w.opts.logger.Error("wal: interval flush failed", Field{Key: "error", Value: err.Error()})
+		}
+	case <-w.closed:
+	}
+}

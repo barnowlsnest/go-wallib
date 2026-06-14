@@ -23,6 +23,7 @@ type WAL struct {
 	active          *segment.Segment
 	closed          chan struct{}
 	requestCh       chan *appendRequest
+	controlCh       chan chan error
 	root            *os.Root
 	dir             string
 	segmentBaseLSNs []uint64
@@ -50,6 +51,7 @@ func Open(dir string, opts ...Option) (w *WAL, report *RecoveryReport, err error
 		opts:      resolved,
 		closed:    make(chan struct{}),
 		requestCh: make(chan *appendRequest, resolved.batchSize*2),
+		controlCh: make(chan chan error), // unbuffered: a send means the writer took it
 	}
 
 	report, err = w.recover()
@@ -325,6 +327,26 @@ func (w *WAL) Append(ctx context.Context, payload []byte) (uint64, error) {
 	}
 
 	return assignedLSNs[0], nil
+}
+
+// Sync forces a flush and fsync of all pending data, blocking until the writer
+// goroutine has completed it. It returns ErrClosed if the WAL is closed.
+func (w *WAL) Sync() error {
+	w.closeMu.RLock()
+	closed := w.isClosed
+	w.closeMu.RUnlock()
+
+	if closed {
+		return ErrClosed
+	}
+
+	done := make(chan error, 1)
+	select {
+	case w.controlCh <- done:
+		return <-done
+	case <-w.closed:
+		return ErrClosed
+	}
 }
 
 // segmentCount reports how many segments make up the log. It is a test helper.
