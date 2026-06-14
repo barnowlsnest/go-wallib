@@ -24,6 +24,7 @@ type WAL struct {
 	closed          chan struct{}
 	requestCh       chan *appendRequest
 	controlCh       chan chan error
+	truncateCh      chan *truncateRequest
 	root            *os.Root
 	dir             string
 	segmentBaseLSNs []uint64
@@ -47,11 +48,12 @@ func Open(dir string, opts ...Option) (w *WAL, report *RecoveryReport, err error
 	}
 
 	w = &WAL{
-		dir:       dir,
-		opts:      resolved,
-		closed:    make(chan struct{}),
-		requestCh: make(chan *appendRequest, resolved.batchSize*2),
-		controlCh: make(chan chan error), // unbuffered: a send means the writer took it
+		dir:        dir,
+		opts:       resolved,
+		closed:     make(chan struct{}),
+		requestCh:  make(chan *appendRequest, resolved.batchSize*2),
+		controlCh:  make(chan chan error), // unbuffered: a send means the writer took it
+		truncateCh: make(chan *truncateRequest),
 	}
 
 	report, err = w.recover()
@@ -343,6 +345,28 @@ func (w *WAL) Sync() error {
 	done := make(chan error, 1)
 	select {
 	case w.controlCh <- done:
+		return <-done
+	case <-w.closed:
+		return ErrClosed
+	}
+}
+
+// Truncate advances the low-water mark, deleting whole segments whose entries
+// are all below upToLSN. The active segment is never deleted, so entries below
+// upToLSN that share the active (or any surviving) segment remain readable;
+// truncation is best-effort reclamation, not a precise per-entry delete.
+func (w *WAL) Truncate(upToLSN uint64) error {
+	w.closeMu.RLock()
+	closed := w.isClosed
+	w.closeMu.RUnlock()
+
+	if closed {
+		return ErrClosed
+	}
+
+	done := make(chan error, 1)
+	select {
+	case w.truncateCh <- &truncateRequest{resultCh: done, upTo: upToLSN}:
 		return <-done
 	case <-w.closed:
 		return ErrClosed
