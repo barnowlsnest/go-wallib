@@ -47,7 +47,10 @@ type Scanner struct {
 // NewScanner returns a Scanner that reads from source and rejects any record
 // whose declared payload length exceeds maxRecordBytes.
 func NewScanner(source io.Reader, maxRecordBytes int) *Scanner {
-	return &Scanner{source: source, maxRecBytes: maxRecordBytes}
+	return &Scanner{
+		source:      source,
+		maxRecBytes: maxRecordBytes,
+	}
 }
 
 // Next attempts to decode the next record from the stream. It returns true when
@@ -88,7 +91,10 @@ func (s *Scanner) Next() bool {
 	}
 
 	s.validBytes += int64(HeaderSize) + int64(payloadLen)
-	s.current = Record{LSN: lsn, Payload: payload}
+	s.current = Record{
+		LSN:     lsn,
+		Payload: payload,
+	}
 
 	return true
 }

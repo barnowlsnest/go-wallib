@@ -64,7 +64,10 @@ func List(dir string) ([]string, error) {
 		if !ok {
 			continue
 		}
-		found = append(found, segmentFile{path: filepath.Join(dir, entry.Name()), baseLSN: baseLSN})
+		found = append(found, segmentFile{
+			path:    filepath.Join(dir, entry.Name()),
+			baseLSN: baseLSN,
+		})
 	}
 
 	slices.SortFunc(found, func(a, b segmentFile) int {
