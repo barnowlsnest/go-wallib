@@ -4,7 +4,7 @@ import (
 	"context"
 	"slices"
 	"time"
-	
+
 	"github.com/barnowlsnest/go-wal/internal/record"
 	"github.com/barnowlsnest/go-wal/internal/segment"
 )
@@ -36,19 +36,19 @@ func (w *WAL) AppendBatch(ctx context.Context, payloads [][]byte) ([]uint64, err
 			return nil, ErrRecordTooLarge
 		}
 	}
-	
+
 	request := &appendRequest{
 		ctx:      ctx,
 		resultCh: make(chan appendResult, 1),
 		payloads: payloads,
 	}
-	
+
 	if err := w.enqueue(ctx, request); err != nil {
 		return nil, err
 	}
-	
+
 	result := <-request.resultCh
-	
+
 	return result.assignedLSNs, result.err
 }
 
@@ -57,11 +57,11 @@ func (w *WAL) AppendBatch(ctx context.Context, payloads [][]byte) ([]uint64, err
 func (w *WAL) enqueue(ctx context.Context, request *appendRequest) error {
 	w.closeMu.RLock()
 	defer w.closeMu.RUnlock()
-	
+
 	if w.isClosed {
 		return ErrClosed
 	}
-	
+
 	select {
 	case w.requestCh <- request:
 		return nil
@@ -90,7 +90,7 @@ func (w *WAL) writerLoop() {
 		case <-w.closed:
 			w.drain()
 			w.finalFlush()
-			
+
 			return
 		}
 	}
@@ -100,11 +100,11 @@ func (w *WAL) writerLoop() {
 // are (or, for SyncBatched, soon become) available, up to batchSize.
 func (w *WAL) gather(first *appendRequest) []*appendRequest {
 	batch := []*appendRequest{first}
-	
+
 	if w.opts.syncPolicy == SyncBatched && w.opts.batchTimeout > 0 {
 		return w.gatherUntilTimeout(batch)
 	}
-	
+
 	return w.gatherNonBlocking(batch)
 }
 
@@ -112,7 +112,7 @@ func (w *WAL) gather(first *appendRequest) []*appendRequest {
 func (w *WAL) gatherUntilTimeout(batch []*appendRequest) []*appendRequest {
 	timer := time.NewTimer(w.opts.batchTimeout)
 	defer timer.Stop()
-	
+
 	for len(batch) < w.opts.batchSize {
 		select {
 		case request := <-w.requestCh:
@@ -121,7 +121,7 @@ func (w *WAL) gatherUntilTimeout(batch []*appendRequest) []*appendRequest {
 			return batch
 		}
 	}
-	
+
 	return batch
 }
 
@@ -135,7 +135,7 @@ func (w *WAL) gatherNonBlocking(batch []*appendRequest) []*appendRequest {
 			return batch
 		}
 	}
-	
+
 	return batch
 }
 
@@ -161,29 +161,29 @@ func (w *WAL) drain() {
 func (w *WAL) commit(batch []*appendRequest) {
 	results := make([]appendResult, len(batch))
 	wroteAny := false
-	
+
 	for i, request := range batch {
 		if err := request.ctx.Err(); err != nil {
 			results[i] = appendResult{err: err}
-			
+
 			continue
 		}
-		
+
 		assignedLSNs, err := w.writeRequest(request)
 		if err != nil {
 			results[i] = appendResult{err: err}
-			
+
 			continue
 		}
-		
+
 		results[i] = appendResult{assignedLSNs: assignedLSNs}
 		wroteAny = true
 	}
-	
+
 	if wroteAny {
 		w.finishBatch(results)
 	}
-	
+
 	for i, request := range batch {
 		request.resultCh <- results[i]
 	}
@@ -200,10 +200,10 @@ func (w *WAL) finishBatch(results []appendResult) {
 				results[i] = appendResult{err: err}
 			}
 		}
-		
+
 		return
 	}
-	
+
 	w.publishLastLSN()
 }
 
@@ -213,7 +213,7 @@ func (w *WAL) flushAfterCommit() error {
 	if w.opts.syncPolicy == SyncInterval {
 		return nil
 	}
-	
+
 	return w.active.Sync()
 }
 
@@ -225,11 +225,11 @@ func (w *WAL) writeRequest(request *appendRequest) ([]uint64, error) {
 		if err := w.writeRecord(lsn, payload); err != nil {
 			return nil, err
 		}
-		
+
 		w.nextLSN++
 		assignedLSNs = append(assignedLSNs, lsn)
 	}
-	
+
 	return assignedLSNs, nil
 }
 
@@ -242,9 +242,9 @@ func (w *WAL) writeRecord(lsn uint64, payload []byte) error {
 			return err
 		}
 	}
-	
+
 	_, err := w.active.Append(lsn, payload)
-	
+
 	return err
 }
 
@@ -253,19 +253,19 @@ func (w *WAL) roll(baseLSN uint64) error {
 	if err := w.active.Sync(); err != nil {
 		return err
 	}
-	
+
 	newSegment, err := segment.Create(w.root, baseLSN)
 	if err != nil {
 		return err
 	}
-	
+
 	sealed := w.active
-	
+
 	w.mu.Lock()
 	w.active = newSegment
 	w.segmentBaseLSNs = append(w.segmentBaseLSNs, baseLSN)
 	w.mu.Unlock()
-	
+
 	return sealed.Close()
 }
 
@@ -273,7 +273,7 @@ func (w *WAL) roll(baseLSN uint64) error {
 func (w *WAL) publishLastLSN() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	w.lastLSN = w.nextLSN - 1
 	if w.firstLSN == 0 {
 		w.firstLSN = w.segmentBaseLSNs[0]
@@ -285,7 +285,7 @@ func (w *WAL) syncActive() error {
 	if w.active == nil {
 		return nil
 	}
-	
+
 	return w.active.Sync()
 }
 
@@ -296,7 +296,7 @@ func (w *WAL) doTruncate(upTo uint64) error {
 	w.mu.RLock()
 	baseLSNs := slices.Clone(w.segmentBaseLSNs)
 	w.mu.RUnlock()
-	
+
 	// Segment i is fully below upTo iff the next segment's base LSN (= segment
 	// i's lastLSN + 1) is <= upTo. The last segment is active and never counted.
 	deletable := 0
@@ -304,25 +304,25 @@ func (w *WAL) doTruncate(upTo uint64) error {
 		if baseLSNs[i+1] > upTo {
 			break
 		}
-		
+
 		deletable = i + 1
 	}
-	
+
 	if deletable == 0 {
 		return nil
 	}
-	
+
 	for i := range deletable {
 		if err := w.removeSegmentFile(baseLSNs[i]); err != nil {
 			return err
 		}
 	}
-	
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.segmentBaseLSNs = w.segmentBaseLSNs[deletable:]
 	w.firstLSN = w.segmentBaseLSNs[0]
-	
+
 	return nil
 }
 
@@ -332,7 +332,7 @@ func (w *WAL) removeSegmentFile(baseLSN uint64) error {
 	if err := w.root.Remove(segment.Name(baseLSN)); err != nil {
 		return err
 	}
-	
+
 	return segment.SyncDir(w.dir)
 }
 
@@ -341,7 +341,7 @@ func (w *WAL) finalFlush() {
 	if w.active == nil {
 		return
 	}
-	
+
 	if err := w.active.Sync(); err != nil {
 		w.opts.logger.Error("wal: final flush failed", Field{Key: "error", Value: err.Error()})
 	}
@@ -356,7 +356,7 @@ func (w *WAL) startFlusher() {
 func (w *WAL) flushLoop() {
 	ticker := time.NewTicker(w.opts.flushInterval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ticker.C:
