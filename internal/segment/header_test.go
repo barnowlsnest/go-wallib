@@ -20,7 +20,7 @@ func TestHeaderSuite(t *testing.T) {
 // realistic header field values resembling a live segment.
 const (
 	sampleBaseLSN   uint64 = 4_200_000
-	sampleCreatedAt int64  = 1_718_000_000_000_000_000 // ~2024-06-10 in Unix ns
+	sampleCreatedAt uint64 = 1_718_000_000_000_000_000 // ~2024-06-10 in Unix ns
 )
 
 func (s *HeaderSuite) TestRoundTrip() {
@@ -109,5 +109,5 @@ func (s *HeaderSuite) TestHeaderByteLayout() {
 	s.Require().Equal(Version, binary.LittleEndian.Uint16(encoded[4:6]), "version offset")
 	s.Require().Equal(uint16(0), binary.LittleEndian.Uint16(encoded[6:8]), "flags offset")
 	s.Require().Equal(sampleBaseLSN, binary.LittleEndian.Uint64(encoded[8:16]), "base lsn offset")
-	s.Require().Equal(uint64(sampleCreatedAt), binary.LittleEndian.Uint64(encoded[16:24]), "created-at offset")
+	s.Require().Equal(sampleCreatedAt, binary.LittleEndian.Uint64(encoded[16:24]), "created-at offset")
 }

@@ -44,8 +44,10 @@ var (
 type Header struct {
 	// BaseLSN is the LSN of the first record this segment may contain.
 	BaseLSN uint64
-	// CreatedAt is the segment creation time in Unix nanoseconds.
-	CreatedAt int64
+	// CreatedAt is the segment creation time in Unix nanoseconds. It is stored
+	// unsigned so encode/decode need no signed-conversion; callers convert from
+	// time.Now().UnixNano() at construction.
+	CreatedAt uint64
 	// Version is the segment format version.
 	Version uint16
 	// Flags is a reserved bitfield, currently always zero.
@@ -60,11 +62,9 @@ func EncodeHeader(header Header) []byte {
 	binary.LittleEndian.PutUint16(encoded[4:6], header.Version)
 	binary.LittleEndian.PutUint16(encoded[6:8], header.Flags)
 	binary.LittleEndian.PutUint64(encoded[8:16], header.BaseLSN)
-	// Full-width int64->uint64 reinterpretation to store the timestamp in the
-	// fixed 8-byte field; no bits are lost, so the gosec overflow warning is a
-	// false positive here.
-	binary.LittleEndian.PutUint64(encoded[16:24], uint64(header.CreatedAt)) //nolint:gosec // bit-preserving same-width conversion
+	binary.LittleEndian.PutUint64(encoded[16:24], header.CreatedAt)
 	binary.LittleEndian.PutUint32(encoded[24:28], crc32.Checksum(encoded[0:24], crcTable))
+
 	return encoded
 }
 
@@ -82,14 +82,14 @@ func DecodeHeader(encoded []byte) (Header, error) {
 	}
 
 	header := Header{
-		Version: binary.LittleEndian.Uint16(encoded[4:6]),
-		Flags:   binary.LittleEndian.Uint16(encoded[6:8]),
-		BaseLSN: binary.LittleEndian.Uint64(encoded[8:16]),
-		//nolint:gosec // bit-preserving same-width uint64->int64 conversion
-		CreatedAt: int64(binary.LittleEndian.Uint64(encoded[16:24])),
+		Version:   binary.LittleEndian.Uint16(encoded[4:6]),
+		Flags:     binary.LittleEndian.Uint16(encoded[6:8]),
+		BaseLSN:   binary.LittleEndian.Uint64(encoded[8:16]),
+		CreatedAt: binary.LittleEndian.Uint64(encoded[16:24]),
 	}
 	if header.Version != Version {
 		return Header{}, ErrUnknownVersion
 	}
+
 	return header, nil
 }

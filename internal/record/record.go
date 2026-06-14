@@ -49,6 +49,7 @@ func Encode(dst []byte, lsn uint64, payload []byte) ([]byte, error) {
 	if n < 0 || n > MaxPayloadSize {
 		return nil, ErrPayloadTooLarge
 	}
+
 	var hdr [HeaderSize]byte
 	binary.LittleEndian.PutUint32(hdr[4:8], uint32(n))
 	binary.LittleEndian.PutUint64(hdr[8:16], lsn)
@@ -60,5 +61,6 @@ func Encode(dst []byte, lsn uint64, payload []byte) ([]byte, error) {
 
 	dst = append(dst, hdr[:]...)
 	dst = append(dst, payload...)
+
 	return dst, nil
 }

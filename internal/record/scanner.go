@@ -63,6 +63,7 @@ func (s *Scanner) Next() bool {
 		if !errors.Is(readErr, io.EOF) {
 			s.firstErr = readErr
 		}
+
 		return false
 	}
 
@@ -88,6 +89,7 @@ func (s *Scanner) Next() bool {
 
 	s.validBytes += int64(HeaderSize) + int64(payloadLen)
 	s.current = Record{LSN: lsn, Payload: payload}
+
 	return true
 }
 
@@ -118,6 +120,7 @@ func (s *Scanner) readHeader(header []byte) error {
 			return err
 		}
 	}
+
 	return nil
 }
 
@@ -127,9 +130,11 @@ func (s *Scanner) readPayload(n int) ([]byte, error) {
 	if n == 0 {
 		return nil, nil
 	}
+
 	if cap(s.payloadBuf) < n {
 		s.payloadBuf = make([]byte, n)
 	}
+
 	s.payloadBuf = s.payloadBuf[:n]
 
 	_, err := io.ReadFull(s.source, s.payloadBuf)
@@ -141,6 +146,7 @@ func (s *Scanner) readPayload(n int) ([]byte, error) {
 			return nil, err
 		}
 	}
+
 	return s.payloadBuf, nil
 }
 
