@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -18,24 +19,22 @@ type openedSeg struct {
 
 // WAL is a Write-Ahead Log. It is safe for concurrent use.
 type WAL struct {
-	root     *os.Root
-	active   *segment.Segment
-	dir      string
-	closed   chan struct{}
-	closeErr error
-
-	// segmentBaseLSNs is the ascending list of base LSNs of the segments that
-	// make up the log; guarded by mu.
+	closeErr        error
+	active          *segment.Segment
+	closed          chan struct{}
+	requestCh       chan *appendRequest
+	root            *os.Root
+	dir             string
 	segmentBaseLSNs []uint64
-
-	opts options
-
-	mu        sync.RWMutex
-	wg        sync.WaitGroup
-	closeOnce sync.Once
-
-	firstLSN uint64
-	lastLSN  uint64
+	opts            options
+	wg              sync.WaitGroup
+	nextLSN         uint64
+	firstLSN        uint64
+	lastLSN         uint64
+	closeMu         sync.RWMutex
+	mu              sync.RWMutex
+	closeOnce       sync.Once
+	isClosed        bool
 }
 
 // Open recovers an existing log in dir or creates a new one. It returns a
@@ -47,9 +46,10 @@ func Open(dir string, opts ...Option) (w *WAL, report *RecoveryReport, err error
 	}
 
 	w = &WAL{
-		dir:    dir,
-		opts:   resolved,
-		closed: make(chan struct{}),
+		dir:       dir,
+		opts:      resolved,
+		closed:    make(chan struct{}),
+		requestCh: make(chan *appendRequest, resolved.batchSize*2),
 	}
 
 	report, err = w.recover()
@@ -125,6 +125,7 @@ func (w *WAL) initEmptyLog() (*RecoveryReport, error) {
 
 	w.active = seg
 	w.segmentBaseLSNs = []uint64{1}
+	w.nextLSN = 1
 
 	return &RecoveryReport{}, nil
 }
@@ -271,6 +272,7 @@ func (w *WAL) installState(segments []openedSeg, firstLSN, lastLSN uint64) error
 	w.active = segments[lastIdx].seg
 	w.firstLSN = firstLSN
 	w.lastLSN = lastLSN
+	w.nextLSN = lastLSN + 1
 
 	return nil
 }
@@ -309,6 +311,22 @@ func (w *WAL) LastLSN() uint64 {
 	return w.lastLSN
 }
 
+// Append durably writes payload as a single record and returns its LSN. It
+// blocks until the configured SyncPolicy's durability guarantee is met.
+//
+// Delivery is at-least-once: if Append returns (lsn, nil) the record is durable;
+// if it returns an error, or the process dies before it returns, the record may
+// or may not be durable, and a retry may create a duplicate with a NEW LSN.
+// Deduplicate using a caller key embedded in the payload, not the LSN.
+func (w *WAL) Append(ctx context.Context, payload []byte) (uint64, error) {
+	assignedLSNs, err := w.AppendBatch(ctx, [][]byte{payload})
+	if err != nil {
+		return 0, err
+	}
+
+	return assignedLSNs[0], nil
+}
+
 // segmentCount reports how many segments make up the log. It is a test helper.
 func (w *WAL) segmentCount() int {
 	w.mu.RLock()
@@ -321,6 +339,10 @@ func (w *WAL) segmentCount() int {
 // resources. It is idempotent.
 func (w *WAL) Close() error {
 	w.closeOnce.Do(func() {
+		w.closeMu.Lock()
+		w.isClosed = true
+		w.closeMu.Unlock()
+
 		close(w.closed)
 		w.wg.Wait()
 
