@@ -40,19 +40,19 @@ type WAL struct {
 
 // Open recovers an existing log in dir or creates a new one. It returns a
 // ready-to-use WAL and a RecoveryReport describing what was found and repaired.
-func Open(dir string, opts ...Option) (*WAL, *RecoveryReport, error) {
+func Open(dir string, opts ...Option) (w *WAL, report *RecoveryReport, err error) {
 	resolved := defaultOptions()
 	for _, apply := range opts {
 		apply(&resolved)
 	}
 
-	w := &WAL{
+	w = &WAL{
 		dir:    dir,
 		opts:   resolved,
 		closed: make(chan struct{}),
 	}
 
-	report, err := w.recover()
+	report, err = w.recover()
 	if err != nil {
 		if w.root != nil {
 			_ = w.root.Close()
