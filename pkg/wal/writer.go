@@ -5,8 +5,8 @@ import (
 	"slices"
 	"time"
 
-	"github.com/barnowlsnest/go-wal/internal/record"
-	"github.com/barnowlsnest/go-wal/internal/segment"
+	"github.com/barnowlsnest/go-wallib/internal/record"
+	"github.com/barnowlsnest/go-wallib/internal/segment"
 )
 
 // appendRequest is a single append handed to the writer goroutine.

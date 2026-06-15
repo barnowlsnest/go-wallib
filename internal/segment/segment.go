@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/barnowlsnest/go-wal/internal/record"
+	"github.com/barnowlsnest/go-wallib/internal/record"
 )
 
 // Segment is an open segment file: a validated header followed by framed

@@ -6,7 +6,7 @@ import (
 
 	"github.com/stretchr/testify/suite"
 
-	"github.com/barnowlsnest/go-wal/internal/segment"
+	"github.com/barnowlsnest/go-wallib/internal/segment"
 )
 
 // realistic WAL payloads resembling serialized state-change commands.

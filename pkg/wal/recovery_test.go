@@ -7,7 +7,7 @@ import (
 
 	"github.com/stretchr/testify/suite"
 
-	"github.com/barnowlsnest/go-wal/internal/segment"
+	"github.com/barnowlsnest/go-wallib/internal/segment"
 )
 
 // RecoverySuite reaches into segment files on disk to simulate crashes and

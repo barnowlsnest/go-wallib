@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/barnowlsnest/go-wal/internal/segment"
+	"github.com/barnowlsnest/go-wallib/internal/segment"
 )
 
 // openedSeg pairs an open segment with the result of scanning its records during

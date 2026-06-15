@@ -7,7 +7,7 @@ import (
 
 	"github.com/stretchr/testify/suite"
 
-	"github.com/barnowlsnest/go-wal/internal/record"
+	"github.com/barnowlsnest/go-wallib/internal/record"
 )
 
 // segMaxRecordBytes is a per-record cap larger than any test payload.

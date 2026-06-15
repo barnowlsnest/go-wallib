@@ -108,7 +108,7 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/barnowlsnest/go-wal
+        - github.com/barnowlsnest/go-wallib
   exclusions:
     generated: lax
     paths:

@@ -6,8 +6,8 @@ import (
 	"io"
 	"os"
 
-	"github.com/barnowlsnest/go-wal/internal/record"
-	"github.com/barnowlsnest/go-wal/internal/segment"
+	"github.com/barnowlsnest/go-wallib/internal/record"
+	"github.com/barnowlsnest/go-wallib/internal/segment"
 )
 
 // Reader is a forward cursor over committed log entries. It is not safe for
