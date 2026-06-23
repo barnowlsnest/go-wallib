@@ -67,6 +67,60 @@ func (w *WAL) Follower(fromLSN uint64, opts ...FollowerOption) (*Follower, error
 	}, nil
 }
 
+// scanResult reports the outcome of one scanBatch call.
+type scanResult int
+
+const (
+	scanContinue  scanResult = iota // batch drained; caller may loop or wait
+	scanStop                        // yield returned false; stop iteration cleanly
+	scanTruncated                   // a gap in the LSN sequence was detected
+	scanReadError                   // reader returned a non-nil error
+)
+
+// scanBatch reads one snapshot's worth of records into yield, updating *highWater
+// and *delivered. It returns a scanResult indicating what the caller should do next.
+func (f *Follower) scanBatch(
+	segmentNames []string,
+	endLSN uint64,
+	highWater *uint64,
+	delivered *bool,
+	yield func(uint64, []byte) bool,
+) (result scanResult) {
+	expectedLSN := *highWater + 1
+	reader := newReaderFrom(f.wal.dir, segmentNames, expectedLSN, endLSN, f.maxRecord)
+
+	for reader.Next() {
+		entry := reader.Entry()
+
+		if entry.LSN > expectedLSN && (*delivered || f.fromLSN > 0) {
+			_ = reader.Close()
+
+			return scanTruncated
+		}
+
+		*highWater = entry.LSN
+		expectedLSN = *highWater + 1
+		*delivered = true
+
+		if !yield(entry.LSN, bytes.Clone(entry.Payload)) {
+			_ = reader.Close()
+
+			return scanStop
+		}
+	}
+
+	scanErr := reader.Err()
+	_ = reader.Close()
+
+	if scanErr != nil {
+		f.err = scanErr
+
+		return scanReadError
+	}
+
+	return scanContinue
+}
+
 // Records returns a range-over-func iterator yielding (LSN, payload) in order.
 // Each payload is a fresh copy owned by the caller. Inspect Err after the loop
 // ends. See the Follower doc for snapshot vs. follow semantics.
@@ -106,25 +160,14 @@ func (f *Follower) Records(ctx context.Context) iter.Seq2[uint64, []byte] {
 				endLSN = f.endLSN
 			}
 
-			reader := newReaderFrom(f.wal.dir, segmentNames, highWater+1, endLSN, f.maxRecord)
-			for reader.Next() {
-				entry := reader.Entry()
-				highWater = entry.LSN
-				delivered = true
+			switch f.scanBatch(segmentNames, endLSN, &highWater, &delivered, yield) {
+			case scanStop:
+				return
+			case scanTruncated:
+				f.err = ErrTruncated
 
-				if !yield(entry.LSN, bytes.Clone(entry.Payload)) {
-					_ = reader.Close()
-
-					return
-				}
-			}
-
-			scanErr := reader.Err()
-			_ = reader.Close()
-
-			if scanErr != nil {
-				f.err = scanErr
-
+				return
+			case scanReadError:
 				return
 			}
 
