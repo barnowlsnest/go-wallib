@@ -26,6 +26,33 @@ type Reader struct {
 	done         bool
 }
 
+// readerSnapshot captures the segment file names, the last committed LSN, and the
+// first available LSN under the read lock, for constructing a point-in-time reader.
+func (w *WAL) readerSnapshot() (segmentNames []string, endLSN, firstLSN uint64) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	segmentNames = make([]string, len(w.segmentBaseLSNs))
+	for i, baseLSN := range w.segmentBaseLSNs {
+		segmentNames[i] = segment.Name(baseLSN)
+	}
+
+	return segmentNames, w.lastLSN, w.firstLSN
+}
+
+// newReaderFrom builds a Reader over a captured snapshot, yielding entries with
+// LSN in [fromLSN, endLSN]. It is the shared core of NewReader and the Follower.
+func newReaderFrom(dir string, segmentNames []string, fromLSN, endLSN uint64, maxRecord int) *Reader {
+	return &Reader{
+		dir:          dir,
+		segmentNames: segmentNames,
+		fromLSN:      fromLSN,
+		endLSN:       endLSN,
+		maxRecord:    maxRecord,
+		done:         endLSN == 0 || fromLSN > endLSN,
+	}
+}
+
 // NewReader returns a cursor yielding entries with LSN >= fromLSN (0 means from
 // the beginning), up to the last committed LSN at the time of this call. Entries
 // committed after this call are not observed.
@@ -38,24 +65,9 @@ func (w *WAL) NewReader(fromLSN uint64) (*Reader, error) {
 		return nil, ErrClosed
 	}
 
-	w.mu.RLock()
-	segmentNames := make([]string, len(w.segmentBaseLSNs))
-	for i, baseLSN := range w.segmentBaseLSNs {
-		segmentNames[i] = segment.Name(baseLSN)
-	}
-	endLSN := w.lastLSN
-	w.mu.RUnlock()
+	segmentNames, endLSN, _ := w.readerSnapshot()
 
-	reader := &Reader{
-		dir:          w.dir,
-		segmentNames: segmentNames,
-		fromLSN:      fromLSN,
-		endLSN:       endLSN,
-		maxRecord:    w.opts.maxRecordSize,
-		done:         endLSN == 0,
-	}
-
-	return reader, nil
+	return newReaderFrom(w.dir, segmentNames, fromLSN, endLSN, w.opts.maxRecordSize), nil
 }
 
 // Next advances to the next entry. It returns false at the end of the snapshot

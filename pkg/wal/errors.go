@@ -19,4 +19,9 @@ var (
 	// ErrInvalidLSN is returned when an LSN argument is outside the valid range,
 	// for example a Truncate or Replay bound beyond the current LastLSN.
 	ErrInvalidLSN = errors.New("wal: invalid lsn")
+
+	// ErrTruncated is returned by a Follower whose next required LSN was reclaimed
+	// by Truncate (its position fell below the low-water mark), so the stream has
+	// an unrecoverable gap.
+	ErrTruncated = errors.New("wal: follower position truncated")
 )
