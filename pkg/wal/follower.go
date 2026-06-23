@@ -119,7 +119,10 @@ func (f *Follower) Records(ctx context.Context) iter.Seq2[uint64, []byte] {
 				}
 			}
 
-			if scanErr := reader.Err(); scanErr != nil {
+			scanErr := reader.Err()
+			_ = reader.Close()
+
+			if scanErr != nil {
 				f.err = scanErr
 
 				return
