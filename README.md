@@ -124,6 +124,32 @@ for entry := range ch {
 has not yet consumed, the follower's iterator ends and `Err()` returns
 `wal.ErrTruncated`. Check `Err()` after every loop.
 
+## Retention
+
+There is **no automatic retention policy**. The log grows until the application
+explicitly reclaims space — there is no TTL, no size-based expiry, and no
+background purge goroutine.
+
+Retention is **caller-driven** via `Truncate(upToLSN)` after you no longer need
+records at or below that LSN. The usual pattern is to persist a snapshot or
+checkpoint, then truncate at that LSN:
+
+```go
+if err := w.Truncate(snapshotLSN); err != nil {
+    panic(err)
+}
+```
+
+`Truncate` deletes **whole closed segment files** and advances `FirstLSN` (the
+low-water mark). The **active segment is never deleted**, so entries below
+`upToLSN` that still live in a surviving segment remain readable — truncation is
+segment-granular best-effort reclamation, not a precise per-entry delete.
+
+`WithMaxSegmentSize` only controls when new segment files are created during
+rolling; it does **not** delete old data. On `Open`, recovery may truncate a
+torn tail or remove empty trailing segments from an interrupted roll; those steps
+repair crash damage and are not retention policy.
+
 ## Sync policies
 
 | Policy          | When the fsync happens                                   | Trade-off                                  |
