@@ -25,9 +25,11 @@ type WAL struct {
 	requestCh       chan *appendRequest
 	controlCh       chan chan error
 	truncateCh      chan *truncateRequest
+	subscribeCh     chan wakeup
 	root            *os.Root
 	dir             string
 	segmentBaseLSNs []uint64
+	pendingWaiters  []chan struct{}
 	opts            options
 	wg              sync.WaitGroup
 	nextLSN         uint64
@@ -48,12 +50,13 @@ func Open(dir string, opts ...Option) (w *WAL, report *RecoveryReport, err error
 	}
 
 	w = &WAL{
-		dir:        dir,
-		opts:       resolved,
-		closed:     make(chan struct{}),
-		requestCh:  make(chan *appendRequest, resolved.batchSize*2),
-		controlCh:  make(chan chan error), // unbuffered: a send means the writer took it
-		truncateCh: make(chan *truncateRequest),
+		dir:         dir,
+		opts:        resolved,
+		closed:      make(chan struct{}),
+		requestCh:   make(chan *appendRequest, resolved.batchSize*2),
+		controlCh:   make(chan chan error), // unbuffered: a send means the writer took it
+		truncateCh:  make(chan *truncateRequest),
+		subscribeCh: make(chan wakeup),
 	}
 
 	report, err = w.recover()

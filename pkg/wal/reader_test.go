@@ -143,3 +143,20 @@ func (s *ReaderSuite) TestReplayStopsOnError() {
 	s.Require().ErrorIs(err, stop)
 	s.Require().Equal(2, visited)
 }
+
+func (s *ReaderSuite) TestErrTruncatedIsDistinctSentinel() {
+	s.Require().Error(ErrTruncated)
+	s.Assert().False(errors.Is(ErrTruncated, ErrCorrupt))
+	s.Assert().False(errors.Is(ErrTruncated, ErrClosed))
+	s.Assert().Contains(ErrTruncated.Error(), "truncated")
+}
+
+func (s *ReaderSuite) TestReaderSnapshotReportsBounds() {
+	w := s.appendSequential(3)
+	defer func() { _ = w.Close() }()
+
+	segmentNames, endLSN, firstLSN := w.readerSnapshot()
+	s.Require().NotEmpty(segmentNames)
+	s.Assert().Equal(uint64(3), endLSN)
+	s.Assert().Equal(uint64(1), firstLSN)
+}

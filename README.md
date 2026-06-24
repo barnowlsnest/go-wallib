@@ -77,6 +77,53 @@ func main() {
 }
 ```
 
+## Following the log
+
+`Follower` is a forward cursor that exposes committed records as a range-over-func
+iterator (`iter.Seq2[uint64, []byte]`). It works in two modes:
+
+- **Snapshot mode** (default) — ends at the tail captured at creation time.
+- **Follow mode** (`wal.WithFollow()`) — blocks at the tail and resumes as new
+  records commit, like `tail -f` for the WAL.
+
+```go
+follower, err := w.Follower(0, wal.WithFollow()) // 0 = from the beginning
+if err != nil {
+    panic(err)
+}
+defer func() { _ = follower.Close() }()
+
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+for lsn, payload := range follower.Records(ctx) {
+    fmt.Printf("LSN %d: %s\n", lsn, payload)
+}
+if err := follower.Err(); err != nil {
+    // handle read error
+}
+```
+
+Each `payload` is a **fresh copy** — callers may retain it after the loop body
+returns without risk of aliasing.
+
+**Multiple independent followers** can tail the log concurrently; each maintains
+its own cursor and position independently of the writer and of other followers.
+
+**`select` integration.** Use `RecordsChan` to receive entries over a channel,
+which composes naturally with `select`:
+
+```go
+ch := follower.RecordsChan(ctx)
+for entry := range ch {
+    fmt.Printf("LSN %d: %s\n", entry.LSN, entry.Payload)
+}
+```
+
+**Truncation.** When `Truncate(upTo)` reclaims segments that a lagging follower
+has not yet consumed, the follower's iterator ends and `Err()` returns
+`wal.ErrTruncated`. Check `Err()` after every loop.
+
 ## Sync policies
 
 | Policy          | When the fsync happens                                   | Trade-off                                  |

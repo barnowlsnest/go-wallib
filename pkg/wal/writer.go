@@ -28,6 +28,80 @@ type truncateRequest struct {
 	upTo     uint64
 }
 
+// wakeup is a follower's one-shot subscription: the writer closes notify when a
+// commit advances past from, or on shutdown. from is the highest LSN the follower
+// has already consumed, so the writer can signal immediately if it is behind.
+type wakeup struct {
+	notify chan struct{}
+	from   uint64
+}
+
+// commitWait is the outcome of awaitCommit.
+type commitWait int
+
+const (
+	// commitWoken means a commit advanced past the waiter's position (or the WAL
+	// is shutting down and closed the waiter); the caller should re-check state.
+	commitWoken commitWait = iota
+	// commitCanceled means the caller's context was canceled while waiting.
+	commitCanceled
+	// commitClosed means the WAL was already closing when the follower tried to subscribe.
+	commitClosed
+)
+
+// awaitCommit parks until a commit advances past from, ctx is canceled, or the
+// WAL closes. It is safe to call from any goroutine; the subscription is handled
+// on the writer goroutine, so there is no lost-wakeup window.
+func (w *WAL) awaitCommit(ctx context.Context, from uint64) commitWait {
+	notify := make(chan struct{})
+
+	select {
+	case w.subscribeCh <- wakeup{
+		notify: notify,
+		from:   from,
+	}:
+	case <-ctx.Done():
+		return commitCanceled
+	case <-w.closed:
+		return commitClosed
+	}
+
+	// No <-w.closed case here: on shutdown the writer's wakeFollowers closes the
+	// parked notify, releasing a parked waiter as commitWoken (the follower then
+	// re-subscribes and the first select returns commitClosed). Removing the
+	// w.closed case makes the outcome deterministic rather than racing notify
+	// against w.closed when both are ready at shutdown.
+	select {
+	case <-notify:
+		return commitWoken
+	case <-ctx.Done():
+		return commitCanceled
+	}
+}
+
+// handleSubscribe runs on the writer goroutine. It signals an already-behind
+// waiter immediately, otherwise parks it until the next commit.
+func (w *WAL) handleSubscribe(sub wakeup) {
+	if w.LastLSN() > sub.from {
+		close(sub.notify)
+
+		return
+	}
+
+	w.pendingWaiters = append(w.pendingWaiters, sub.notify)
+}
+
+// wakeFollowers runs on the writer goroutine. It closes every parked waiter so
+// followers re-check state, then clears the list. close never blocks, so a slow
+// follower can never stall the writer.
+func (w *WAL) wakeFollowers() {
+	for _, notify := range w.pendingWaiters {
+		close(notify)
+	}
+
+	w.pendingWaiters = w.pendingWaiters[:0]
+}
+
 // AppendBatch durably writes multiple records as one group commit and returns
 // their assigned LSNs in order. See Append for delivery semantics.
 func (w *WAL) AppendBatch(ctx context.Context, payloads [][]byte) ([]uint64, error) {
@@ -87,9 +161,12 @@ func (w *WAL) writerLoop() {
 			responseCh <- w.syncActive()
 		case request := <-w.truncateCh:
 			request.resultCh <- w.doTruncate(request.upTo)
+		case sub := <-w.subscribeCh:
+			w.handleSubscribe(sub)
 		case <-w.closed:
 			w.drain()
 			w.finalFlush()
+			w.wakeFollowers()
 
 			return
 		}
@@ -205,6 +282,7 @@ func (w *WAL) finishBatch(results []appendResult) {
 	}
 
 	w.publishLastLSN()
+	w.wakeFollowers()
 }
 
 // flushAfterCommit fsyncs the active segment unless SyncInterval defers that to
