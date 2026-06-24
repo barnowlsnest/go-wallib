@@ -73,8 +73,12 @@ func (s *FollowerSuite) TestSnapshotFromMidLSN() {
 	s.Require().NoError(err)
 	defer func() { _ = follower.Close() }()
 
-	lsns, _ := s.collectSnapshot(follower)
-	s.Assert().Equal([]uint64{3, 4, 5}, lsns)
+	lsns, payloads := s.collectSnapshot(follower)
+	s.Require().Equal([]uint64{3, 4, 5}, lsns)
+
+	for i, lsn := range lsns {
+		s.Assert().Equal(payloadForLSN(lsn), payloads[i])
+	}
 }
 
 // Snapshot mode does not observe records appended after Follower() is called.

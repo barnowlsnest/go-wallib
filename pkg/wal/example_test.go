@@ -2,6 +2,8 @@ package wal
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -117,4 +119,57 @@ func (s *ExampleSuite) TestRecoveryAfterReopen() {
 	s.Require().Equal(uint64(4), lsn)
 	s.Require().Equal(uint64(1), second.FirstLSN())
 	s.Require().Equal(uint64(4), second.LastLSN())
+}
+
+func ExampleFollower_follow() {
+	dir, err := os.MkdirTemp("", "wal-follow-*")
+	if err != nil {
+		panic(err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	w, _, err := Open(dir, WithSyncPolicy(SyncImmediate))
+	if err != nil {
+		panic(err)
+	}
+	defer func() { _ = w.Close() }()
+
+	// Two records are already committed before we start following.
+	for i := 1; i <= 2; i++ {
+		if _, appendErr := w.Append(context.Background(), payloadForLSN(uint64(i))); appendErr != nil {
+			panic(appendErr)
+		}
+	}
+
+	follower, err := w.Follower(0, WithFollow())
+	if err != nil {
+		panic(err)
+	}
+	defer func() { _ = follower.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// In follow mode the follower also delivers records committed AFTER it was
+	// created (a snapshot reader would stop at LSN 2). Append two more.
+	for i := 3; i <= 4; i++ {
+		if _, appendErr := w.Append(ctx, payloadForLSN(uint64(i))); appendErr != nil {
+			panic(appendErr)
+		}
+	}
+
+	// The loop blocks at the tail and resumes as new records commit; stop after
+	// the fourth so the example terminates.
+	for lsn, payload := range follower.Records(ctx) {
+		fmt.Printf("LSN %d: %s\n", lsn, payload)
+
+		if lsn == 4 {
+			break
+		}
+	}
+	// Output:
+	// LSN 1: {"op":"set","key":"row:1","seq":1}
+	// LSN 2: {"op":"set","key":"row:2","seq":2}
+	// LSN 3: {"op":"set","key":"row:3","seq":3}
+	// LSN 4: {"op":"set","key":"row:4","seq":4}
 }

@@ -239,6 +239,8 @@ func (f *Follower) Close() error {
 // channel is unbuffered, so a slow receiver makes the bridge block at the send
 // (the follower lags, never the writer). Call either Records or RecordsChan once
 // per Follower.
+// If ctx is canceled while an entry is in flight on the send, the stream ends
+// cleanly and Err returns nil (a canceled send is treated as a clean stop).
 func (f *Follower) RecordsChan(ctx context.Context) <-chan Entry {
 	out := make(chan Entry)
 
