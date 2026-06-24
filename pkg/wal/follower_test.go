@@ -291,6 +291,90 @@ func (s *FollowerSuite) TestFollowWALCloseReturnsErrClosed() {
 	}
 }
 
+// RecordsChan delivers a snapshot's entries by value and closes at the tail.
+func (s *FollowerSuite) TestRecordsChanSnapshot() {
+	w := s.appendSequential(3)
+	defer func() { _ = w.Close() }()
+
+	follower, err := w.Follower(0)
+	s.Require().NoError(err)
+	defer func() { _ = follower.Close() }()
+
+	var got []uint64
+	for entry := range follower.RecordsChan(context.Background()) {
+		got = append(got, entry.LSN)
+		s.Assert().Equal(payloadForLSN(entry.LSN), entry.Payload)
+	}
+	s.Require().NoError(follower.Err())
+	s.Assert().Equal([]uint64{1, 2, 3}, got)
+}
+
+// RecordsChan composes with select against another channel in follow mode.
+func (s *FollowerSuite) TestRecordsChanSelectInFollowMode() {
+	w := s.appendSequential(1)
+	defer func() { _ = w.Close() }()
+
+	follower, err := w.Follower(0, WithFollow())
+	s.Require().NoError(err)
+	defer func() { _ = follower.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entries := follower.RecordsChan(ctx)
+
+	_, err = w.Append(context.Background(), payloadForLSN(2))
+	s.Require().NoError(err)
+
+	other := make(chan struct{})
+	got := make([]uint64, 0, 2)
+	for len(got) < 2 {
+		select {
+		case entry := <-entries:
+			got = append(got, entry.LSN)
+		case <-other:
+			s.Fail("unexpected other event")
+		case <-time.After(2 * time.Second):
+			s.Fail("RecordsChan stalled", "got %v", got)
+
+			return
+		}
+	}
+	s.Assert().Equal([]uint64{1, 2}, got)
+}
+
+// Closing the follower stops the bridge goroutine even when blocked on send.
+func (s *FollowerSuite) TestRecordsChanCloseStopsBridge() {
+	w := s.appendSequential(1)
+	defer func() { _ = w.Close() }()
+
+	follower, err := w.Follower(0, WithFollow())
+	s.Require().NoError(err)
+
+	// Never receive from the channel, forcing the bridge to block on send.
+	entries := follower.RecordsChan(context.Background())
+	_, err = w.Append(context.Background(), payloadForLSN(2))
+	s.Require().NoError(err)
+
+	time.Sleep(50 * time.Millisecond) // let the bridge block on a send
+	s.Require().NoError(follower.Close())
+
+	// The channel must eventually close (drain whatever is buffered/in flight).
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+
+		for entry := range entries {
+			_ = entry
+		}
+	}()
+
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		s.Fail("RecordsChan did not close after Follower.Close")
+	}
+}
+
 // A follower lapped by Truncate stops with ErrTruncated.
 func (s *FollowerSuite) TestFollowTruncatedPosition() {
 	// Tiny segments so each record rolls into its own segment, making whole

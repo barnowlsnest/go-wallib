@@ -29,6 +29,7 @@ func WithFollow() FollowerOption {
 type Follower struct {
 	wal        *WAL
 	cancel     context.CancelFunc
+	done       chan struct{}
 	err        error
 	maxRecord  int
 	endLSN     uint64
@@ -60,6 +61,7 @@ func (w *WAL) Follower(fromLSN uint64, opts ...FollowerOption) (*Follower, error
 
 	return &Follower{
 		wal:       w,
+		done:      make(chan struct{}),
 		maxRecord: w.opts.maxRecordSize,
 		endLSN:    endLSN,
 		fromLSN:   fromLSN,
@@ -222,7 +224,37 @@ func (f *Follower) Close() error {
 			f.cancel()
 		}
 		f.mu.Unlock()
+
+		close(f.done)
 	})
 
 	return nil
+}
+
+// RecordsChan is a channel adapter over Records for callers that need to select
+// the follower against other event sources. It starts one goroutine that runs
+// the Records iterator and delivers each entry by value on the returned channel.
+// The channel is closed when the loop ends (snapshot tail, ctx cancellation, WAL
+// close, Close, or a terminal error); call Err afterward to distinguish. The
+// channel is unbuffered, so a slow receiver makes the bridge block at the send
+// (the follower lags, never the writer). Call either Records or RecordsChan once
+// per Follower.
+func (f *Follower) RecordsChan(ctx context.Context) <-chan Entry {
+	out := make(chan Entry)
+
+	go func() {
+		defer close(out)
+
+		for lsn, payload := range f.Records(ctx) {
+			select {
+			case out <- Entry{Payload: payload, LSN: lsn}:
+			case <-ctx.Done():
+				return
+			case <-f.done:
+				return
+			}
+		}
+	}()
+
+	return out
 }
