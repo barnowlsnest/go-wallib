@@ -337,6 +337,13 @@ func (w *WAL) Append(ctx context.Context, payload []byte) (uint64, error) {
 // Sync forces a flush and fsync of all pending data, blocking until the writer
 // goroutine has completed it. It returns ErrClosed if the WAL is closed.
 func (w *WAL) Sync() error {
+	ctx, cancel := context.WithTimeout(context.Background(), w.opts.maxOperationTimeout)
+	defer cancel()
+
+	return w.SyncContext(ctx)
+}
+
+func (w *WAL) SyncContext(ctx context.Context) error {
 	w.closeMu.RLock()
 	closed := w.isClosed
 	w.closeMu.RUnlock()
@@ -351,6 +358,8 @@ func (w *WAL) Sync() error {
 		return <-done
 	case <-w.closed:
 		return ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -359,6 +368,13 @@ func (w *WAL) Sync() error {
 // upToLSN that share the active (or any surviving) segment remain readable;
 // truncation is best-effort reclamation, not a precise per-entry delete.
 func (w *WAL) Truncate(upToLSN uint64) error {
+	ctx, cancel := context.WithTimeout(context.Background(), w.opts.maxOperationTimeout)
+	defer cancel()
+
+	return w.TruncateContext(ctx, upToLSN)
+}
+
+func (w *WAL) TruncateContext(ctx context.Context, upToLSN uint64) error {
 	w.closeMu.RLock()
 	closed := w.isClosed
 	w.closeMu.RUnlock()
@@ -373,6 +389,8 @@ func (w *WAL) Truncate(upToLSN uint64) error {
 		return <-done
 	case <-w.closed:
 		return ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
