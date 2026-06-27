@@ -44,35 +44,38 @@ func (noopLogger) Error(string, ...Field) {}
 
 // Default option values.
 const (
-	defaultMaxSegmentSize = 64 << 20 // 64 MiB soft roll threshold
-	defaultMaxRecordSize  = 64 << 20 // 64 MiB hard per-record limit
-	defaultBatchSize      = 256
-	defaultBatchTimeout   = 2 * time.Millisecond
-	defaultFlushInterval  = 100 * time.Millisecond
+	defaultMaxSegmentSize      = 64 << 20 // 64 MiB soft roll threshold
+	defaultMaxRecordSize       = 64 << 20 // 64 MiB hard per-record limit
+	defaultBatchSize           = 256
+	defaultBatchTimeout        = 2 * time.Millisecond
+	defaultFlushInterval       = 100 * time.Millisecond
+	defaultMaxOperationTimeout = 30 * time.Second
 )
 
 // options holds the resolved configuration for a WAL. Fields are ordered to
 // minimize struct padding (the interface, which carries a pointer, comes first).
 type options struct {
-	logger         Logger
-	maxSegmentSize int64
-	maxRecordSize  int
-	batchSize      int
-	batchTimeout   time.Duration
-	flushInterval  time.Duration
-	syncPolicy     SyncPolicy
+	logger              Logger
+	maxSegmentSize      int64
+	maxOperationTimeout time.Duration
+	maxRecordSize       int
+	batchSize           int
+	batchTimeout        time.Duration
+	flushInterval       time.Duration
+	syncPolicy          SyncPolicy
 }
 
 // defaultOptions returns the configuration used when no Option overrides it.
 func defaultOptions() options {
 	return options{
-		logger:         noopLogger{},
-		maxSegmentSize: defaultMaxSegmentSize,
-		maxRecordSize:  defaultMaxRecordSize,
-		batchSize:      defaultBatchSize,
-		batchTimeout:   defaultBatchTimeout,
-		flushInterval:  defaultFlushInterval,
-		syncPolicy:     SyncBatched,
+		logger:              noopLogger{},
+		maxSegmentSize:      defaultMaxSegmentSize,
+		maxRecordSize:       defaultMaxRecordSize,
+		batchSize:           defaultBatchSize,
+		batchTimeout:        defaultBatchTimeout,
+		flushInterval:       defaultFlushInterval,
+		syncPolicy:          SyncBatched,
+		maxOperationTimeout: defaultMaxOperationTimeout,
 	}
 }
 
@@ -107,6 +110,10 @@ func WithBatchTimeout(window time.Duration) Option {
 // WithFlushInterval sets the background fsync period for SyncInterval.
 func WithFlushInterval(period time.Duration) Option {
 	return func(o *options) { o.flushInterval = period }
+}
+
+func WithMaxOperationTimeout(timeout time.Duration) Option {
+	return func(o *options) { o.maxOperationTimeout = timeout }
 }
 
 // WithLogger sets an optional logger. A nil logger is ignored, leaving the
