@@ -344,6 +344,11 @@ func (w *WAL) roll(baseLSN uint64) error {
 	w.segmentBaseLSNs = append(w.segmentBaseLSNs, baseLSN)
 	w.mu.Unlock()
 
+	w.opts.logger.Debug("wal: rolled to new segment",
+		Field{Key: "sealedBaseLSN", Value: sealed.BaseLSN()},
+		Field{Key: "newBaseLSN", Value: baseLSN},
+	)
+
 	return sealed.Close()
 }
 
@@ -394,12 +399,23 @@ func (w *WAL) doTruncate(upTo uint64) error {
 		if err := w.removeSegmentFile(baseLSNs[i]); err != nil {
 			return err
 		}
+
+		w.opts.logger.Debug("wal: deleted truncated segment",
+			Field{Key: "baseLSN", Value: baseLSNs[i]},
+		)
 	}
 
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	w.segmentBaseLSNs = w.segmentBaseLSNs[deletable:]
-	w.firstLSN = w.segmentBaseLSNs[0]
+	newFirstLSN := w.segmentBaseLSNs[0]
+	w.firstLSN = newFirstLSN
+	w.mu.Unlock()
+
+	w.opts.logger.Info("wal: truncated log",
+		Field{Key: "segmentsDeleted", Value: deletable},
+		Field{Key: "upTo", Value: upTo},
+		Field{Key: "firstLSN", Value: newFirstLSN},
+	)
 
 	return nil
 }

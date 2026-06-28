@@ -106,6 +106,12 @@ func (w *WAL) recover() (*RecoveryReport, error) {
 		return nil, truncErr
 	}
 
+	if report.BytesTruncated > 0 {
+		w.opts.logger.Info("wal: truncated torn tail on recovery",
+			Field{Key: "bytesTruncated", Value: report.BytesTruncated},
+		)
+	}
+
 	firstLSN, lastLSN, total := computeBounds(segments)
 	report.EntriesRecovered = total
 	report.FirstLSN = firstLSN
@@ -120,6 +126,15 @@ func (w *WAL) recover() (*RecoveryReport, error) {
 		return nil, err
 	}
 
+	w.opts.logger.Info("wal: recovery complete",
+		Field{Key: "entriesRecovered", Value: report.EntriesRecovered},
+		Field{Key: "firstLSN", Value: report.FirstLSN},
+		Field{Key: "lastLSN", Value: report.LastLSN},
+		Field{Key: "bytesTruncated", Value: report.BytesTruncated},
+		Field{Key: "segmentsRemoved", Value: report.SegmentsRemoved},
+		Field{Key: "segments", Value: len(segments)},
+	)
+
 	return report, nil
 }
 
@@ -133,6 +148,8 @@ func (w *WAL) initEmptyLog() (*RecoveryReport, error) {
 	w.active = seg
 	w.segmentBaseLSNs = []uint64{1}
 	w.nextLSN = 1
+
+	w.opts.logger.Info("wal: created new empty log", Field{Key: "dir", Value: w.dir})
 
 	return &RecoveryReport{}, nil
 }
@@ -248,6 +265,7 @@ func (w *WAL) pruneEmptyTrailing(
 // removeOpened closes and deletes one opened segment, then fsyncs the directory.
 func (w *WAL) removeOpened(report *RecoveryReport, opened openedSeg) error {
 	name := opened.seg.Name()
+	baseLSN := opened.seg.BaseLSN()
 	if err := opened.seg.Close(); err != nil {
 		return err
 	}
@@ -257,6 +275,11 @@ func (w *WAL) removeOpened(report *RecoveryReport, opened openedSeg) error {
 	}
 
 	report.SegmentsRemoved++
+
+	w.opts.logger.Debug("wal: removed empty trailing segment",
+		Field{Key: "segment", Value: name},
+		Field{Key: "baseLSN", Value: baseLSN},
+	)
 
 	return segment.SyncDir(w.dir)
 }
