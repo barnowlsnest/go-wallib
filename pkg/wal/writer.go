@@ -2,6 +2,7 @@ package wal
 
 import (
 	"context"
+	"os"
 	"slices"
 	"time"
 
@@ -22,8 +23,11 @@ type appendResult struct {
 	assignedLSNs []uint64
 }
 
-// truncateRequest asks the writer goroutine to delete whole segments below upTo.
-type truncateRequest struct {
+// writerOpRequest carries a boundary operation to the writer goroutine: a
+// Truncate (delete whole segments below upTo) or a CutOffset (delete every record
+// below upTo, rewriting the boundary segment if upTo falls inside one). resultCh
+// receives the outcome. The destination channel selects which operation runs.
+type writerOpRequest struct {
 	resultCh chan error
 	upTo     uint64
 }
@@ -161,6 +165,8 @@ func (w *WAL) writerLoop() {
 			responseCh <- w.syncActive()
 		case request := <-w.truncateCh:
 			request.resultCh <- w.doTruncate(request.upTo)
+		case request := <-w.cutCh:
+			request.resultCh <- w.doCut(request.upTo)
 		case sub := <-w.subscribeCh:
 			w.handleSubscribe(sub)
 		case <-w.closed:
@@ -421,9 +427,13 @@ func (w *WAL) doTruncate(upTo uint64) error {
 }
 
 // removeSegmentFile deletes one (already closed) segment file and fsyncs the
-// directory so the removal is durable.
+// directory so the removal is durable. A file that is already gone is treated as
+// success: the delete's goal — that segment file not existing — is already met.
+// This keeps a cut or truncate that failed partway (leaving the in-memory index
+// listing a base whose file was already removed) from wedging a later delete of
+// that base on a not-exist error, until recovery reconciles the index.
 func (w *WAL) removeSegmentFile(baseLSN uint64) error {
-	if err := w.root.Remove(segment.Name(baseLSN)); err != nil {
+	if err := w.root.Remove(segment.Name(baseLSN)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 
@@ -472,4 +482,181 @@ func (w *WAL) requestIntervalFlush() {
 		}
 	case <-w.closed:
 	}
+}
+
+// doCut deletes every record below upTo, running on the writer goroutine so it
+// cannot race appends, rolls, or truncates. Whole segments below the cut are
+// deleted; the segment containing the cut (possibly the active one) is rewritten
+// into seg-<cut>. seg-<cut> is created durably before any delete, so an
+// interrupted cut leaves an overlap that recovery reconciles rather than losing
+// data.
+func (w *WAL) doCut(upTo uint64) error {
+	w.mu.RLock()
+	baseLSNs := slices.Clone(w.segmentBaseLSNs)
+	firstLSN := w.firstLSN
+	nextLSN := w.nextLSN
+	w.mu.RUnlock()
+
+	cut := min(upTo, nextLSN) // cannot cut LSNs that do not exist yet
+
+	switch {
+	case firstLSN == 0 || cut <= firstLSN:
+		return nil
+	case cut >= nextLSN:
+		return w.cutEverything(baseLSNs, nextLSN)
+	}
+
+	boundary := boundaryIndex(baseLSNs, cut)
+	if baseLSNs[boundary] == cut {
+		return w.cutDeleteBelow(baseLSNs, boundary, cut)
+	}
+
+	return w.cutRewriteBoundary(baseLSNs, boundary, cut)
+}
+
+// boundaryIndex returns the index of the last segment whose base LSN is <= cut,
+// i.e. the segment that either starts at or contains cut.
+func boundaryIndex(baseLSNs []uint64, cut uint64) int {
+	boundary := 0
+	for i := range baseLSNs {
+		if baseLSNs[i] > cut {
+			break
+		}
+
+		boundary = i
+	}
+
+	return boundary
+}
+
+// cutDeleteBelow handles a cut that lands exactly on a segment base: delete every
+// segment below the boundary, no rewrite needed.
+func (w *WAL) cutDeleteBelow(baseLSNs []uint64, boundary int, cut uint64) error {
+	for i := range boundary {
+		if err := w.removeSegmentFile(baseLSNs[i]); err != nil {
+			return err
+		}
+
+		w.opts.logger.Debug("wal: cut deleted segment", Field{Key: "baseLSN", Value: baseLSNs[i]})
+	}
+
+	w.mu.Lock()
+	w.segmentBaseLSNs = w.segmentBaseLSNs[boundary:]
+	w.firstLSN = cut
+	w.mu.Unlock()
+
+	w.logCut(cut, boundary, false)
+
+	return nil
+}
+
+// cutRewriteBoundary rewrites the segment containing cut into seg-<cut>, then
+// deletes every below-cut segment (ascending, the old boundary last, so an
+// interrupted cut always leaves seg-<cut> overlapping the old boundary rather
+// than a gap). If the boundary was the active segment, seg-<cut> becomes active.
+func (w *WAL) cutRewriteBoundary(baseLSNs []uint64, boundary int, cut uint64) error {
+	isActive := boundary == len(baseLSNs)-1
+
+	source := w.active
+	if !isActive {
+		opened, err := segment.Open(w.root, baseLSNs[boundary])
+		if err != nil {
+			return err
+		}
+		defer func() { _ = opened.Close() }()
+
+		source = opened
+	}
+
+	replacement, err := segment.RewriteFrom(w.root, source, cut, w.opts.maxRecordSize)
+	if err != nil {
+		return err
+	}
+
+	for i := 0; i <= boundary; i++ {
+		if err := w.removeSegmentFile(baseLSNs[i]); err != nil {
+			_ = replacement.Close()
+
+			return err
+		}
+	}
+
+	w.mu.Lock()
+	oldActive := w.active
+	w.segmentBaseLSNs = append([]uint64{cut}, w.segmentBaseLSNs[boundary+1:]...)
+	w.firstLSN = cut
+	if isActive {
+		w.active = replacement
+	}
+	w.mu.Unlock()
+
+	if isActive {
+		err = oldActive.Close()
+	} else {
+		err = replacement.Close() // sealed replacement: readers reopen on demand
+	}
+
+	if err != nil {
+		return err
+	}
+
+	w.logCut(cut, boundary, true)
+
+	return nil
+}
+
+// cutEverything deletes every existing record and installs a fresh empty active
+// segment based at nextLSN, so future appends stay monotonic and gapless. The new
+// segment is created durably before any delete; an interrupted cut-everything
+// reverts to the pre-cut log (its trailing empty segment is pruned on recovery).
+func (w *WAL) cutEverything(baseLSNs []uint64, nextLSN uint64) error {
+	// A leftover empty seg-<nextLSN> from a previously interrupted cut-everything
+	// would block the exclusive create below. It holds no records (cut-everything
+	// only ever creates it empty), so removing it first is safe and lets a retry
+	// after a partial failure proceed instead of wedging on an already-exists error.
+	if err := w.root.Remove(segment.Name(nextLSN)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	replacement, err := segment.Create(w.root, nextLSN)
+	if err != nil {
+		return err
+	}
+
+	for i := range baseLSNs {
+		if err := w.removeSegmentFile(baseLSNs[i]); err != nil {
+			_ = replacement.Close()
+
+			return err
+		}
+	}
+
+	w.mu.Lock()
+	oldActive := w.active
+	w.active = replacement
+	w.segmentBaseLSNs = []uint64{nextLSN}
+	w.firstLSN = 0
+	w.mu.Unlock()
+
+	if err := oldActive.Close(); err != nil {
+		return err
+	}
+
+	w.opts.logger.Info("wal: cut entire log",
+		Field{Key: "segmentsDeleted", Value: len(baseLSNs)},
+		Field{Key: "newActiveBaseLSN", Value: nextLSN},
+	)
+
+	return nil
+}
+
+// logCut emits the completion log line shared by the delete-only and rewrite
+// cut paths.
+func (w *WAL) logCut(cut uint64, boundary int, boundaryRewritten bool) {
+	w.opts.logger.Info("wal: cut log",
+		Field{Key: "upTo", Value: cut},
+		Field{Key: "firstLSN", Value: cut},
+		Field{Key: "segmentsDeleted", Value: boundary},
+		Field{Key: "boundaryRewritten", Value: boundaryRewritten},
+	)
 }

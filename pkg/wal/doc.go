@@ -25,6 +25,13 @@
 // a precise per-entry delete. WithMaxSegmentSize controls when new segment
 // files are created during rolling; it does not delete old data.
 //
+// CutOffset is the precise counterpart to Truncate. It also advances FirstLSN,
+// but it deletes every record below the given LSN even when that LSN falls inside
+// a segment — rewriting the boundary segment (including the active one) to drop
+// the below-LSN records. Like Truncate it never lowers the next assigned LSN, so
+// the log stays monotonic and gapless; a CutOffset past LastLSN empties the log
+// while preserving LSN continuity for future appends.
+//
 // On Open, recovery may truncate a torn tail or remove empty trailing segments
 // from an interrupted roll; those steps repair crash damage and are not
 // retention policy.

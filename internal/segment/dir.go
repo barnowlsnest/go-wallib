@@ -18,6 +18,12 @@ const ext = ".wal"
 // sort lexicographically in the same order as their numeric base LSN.
 const nameWidth = 20
 
+// TempSuffix is appended to a segment's canonical filename while RewriteFrom
+// builds it, before the atomic rename publishes it. A file ending in
+// ext+TempSuffix is a partial segment from an interrupted rewrite and holds no
+// committed data.
+const TempSuffix = ".tmp"
+
 // Name returns the canonical segment filename for a given base LSN, e.g.
 // Name(42) == "00000000000000000042.wal".
 func Name(baseLSN uint64) string {
@@ -79,6 +85,36 @@ func List(dir string) ([]string, error) {
 		paths[i] = sf.path
 	}
 	return paths, nil
+}
+
+// RemoveStaleTempFiles deletes leftover "*.wal.tmp" files from a RewriteFrom that
+// crashed before its atomic rename. They were never published and hold no
+// committed data, so removing them on recovery reclaims their space. It fsyncs
+// the directory when it removed anything, and reports how many it removed.
+func RemoveStaleTempFiles(root *os.Root, dir string) (int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, err
+	}
+
+	removed := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ext+TempSuffix) {
+			continue
+		}
+
+		if removeErr := root.Remove(entry.Name()); removeErr != nil {
+			return removed, removeErr
+		}
+
+		removed++
+	}
+
+	if removed > 0 {
+		return removed, SyncDir(dir)
+	}
+
+	return removed, nil
 }
 
 // SyncDir fsyncs a directory so that prior file creations, renames, and removals
