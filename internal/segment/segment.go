@@ -198,6 +198,89 @@ func (s *Segment) TruncateTo(offset int64) error {
 	return nil
 }
 
+// RewriteFrom builds seg-<fromLSN> holding every record of src whose LSN is >=
+// fromLSN and returns it open and fsynced. It publishes atomically: the records
+// are written to a temporary file, fully fsynced, and only then renamed to the
+// canonical segment name (followed by a directory fsync). So the canonical name
+// can only ever appear pointing at a COMPLETE segment; a crash mid-rewrite leaves
+// at most a stale "*.wal.tmp" file (ignored by List, deleted by
+// RemoveStaleTempFiles) and never a durable-but-empty segment that recovery would
+// wrongly trust over the original. src is left untouched.
+func RewriteFrom(root *os.Root, src *Segment, fromLSN uint64, maxRecordSize int) (*Segment, error) {
+	name := Name(fromLSN)
+	tempName := name + TempSuffix
+
+	// Clear any leftover temp from a prior interrupted rewrite so O_EXCL succeeds;
+	// it holds no committed data (it was never renamed).
+	if err := root.Remove(tempName); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	file, err := root.OpenFile(tempName, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	// Close and discard the temp file unless we publish it successfully.
+	committed := false
+	defer func() {
+		if !committed {
+			_ = file.Close()
+			_ = root.Remove(tempName)
+		}
+	}()
+
+	header := EncodeHeader(Header{
+		Version:   Version,
+		BaseLSN:   fromLSN,
+		CreatedAt: nowUnixNanos(),
+	})
+	if _, err := file.WriteAt(header, 0); err != nil {
+		return nil, err
+	}
+
+	dst := &Segment{
+		file:    file,
+		name:    name,
+		baseLSN: fromLSN,
+		size:    HeaderSize,
+		lastLSN: fromLSN - 1,
+	}
+
+	section := io.NewSectionReader(src.file, HeaderSize, src.size-HeaderSize)
+	scanner := record.NewScanner(bufio.NewReader(section), maxRecordSize)
+	for scanner.Next() {
+		scanned := scanner.Record()
+		if scanned.LSN < fromLSN {
+			continue
+		}
+
+		if _, appendErr := dst.Append(scanned.LSN, scanned.Payload); appendErr != nil {
+			return nil, appendErr
+		}
+	}
+
+	if scanErr := scanner.Err(); scanErr != nil {
+		return nil, scanErr
+	}
+
+	// Sync the full contents, THEN publish the name, THEN make the rename durable.
+	if err := dst.Sync(); err != nil {
+		return nil, err
+	}
+
+	if err := root.Rename(tempName, name); err != nil {
+		return nil, err
+	}
+
+	if err := fsyncDir(root); err != nil {
+		return nil, err
+	}
+
+	committed = true
+
+	return dst, nil
+}
+
 // Close closes the underlying file.
 func (s *Segment) Close() error { return s.file.Close() }
 

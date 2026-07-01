@@ -135,3 +135,87 @@ func (s *SegmentSuite) TestScanTornTailThenTruncate() {
 	s.Require().Equal(uint64(1), result.LastLSN)
 	s.Require().Equal(goodSize, result.ValidEnd, "truncation point is the end of the last good record")
 }
+
+func (s *SegmentSuite) TestRewriteFromKeepsRecordsAtOrAboveThreshold() {
+	src, err := Create(s.root, 10)
+	s.Require().NoError(err)
+
+	payloads := [][]byte{segSetCommand, segDeleteCommand, segCheckpoint}
+	for i, payload := range payloads {
+		_, appendErr := src.Append(uint64(10+i), payload) // LSNs 10, 11, 12
+		s.Require().NoError(appendErr)
+	}
+	s.Require().NoError(src.Sync())
+
+	dst, err := RewriteFrom(s.root, src, 11, segMaxRecordBytes) // keep 11, 12
+	s.Require().NoError(err)
+	defer func() { s.Require().NoError(dst.Close()) }()
+
+	s.Require().Equal(uint64(11), dst.BaseLSN())
+	s.Require().Equal(Name(11), dst.Name())
+	s.Require().Equal(uint64(12), dst.LastLSN())
+
+	result := dst.Scan(segMaxRecordBytes)
+	s.Require().NoError(result.Err)
+	s.Require().Equal(uint64(2), result.Records, "only records with LSN >= 11 survive")
+	s.Require().Equal(uint64(12), result.LastLSN)
+
+	// src is untouched.
+	s.Require().Equal(uint64(12), src.LastLSN())
+	s.Require().NoError(src.Close())
+}
+
+func (s *SegmentSuite) TestRewriteFromAllRecordsBelowThresholdIsEmpty() {
+	src, err := Create(s.root, 1)
+	s.Require().NoError(err)
+	_, err = src.Append(1, segSetCommand)
+	s.Require().NoError(err)
+	s.Require().NoError(src.Sync())
+
+	dst, err := RewriteFrom(s.root, src, 5, segMaxRecordBytes) // nothing kept
+	s.Require().NoError(err)
+	defer func() { s.Require().NoError(dst.Close()) }()
+
+	s.Require().Equal(int64(HeaderSize), dst.Size(), "no records copied")
+	result := dst.Scan(segMaxRecordBytes)
+	s.Require().NoError(result.Err)
+	s.Require().Equal(uint64(0), result.Records)
+	s.Require().NoError(src.Close())
+}
+
+func (s *SegmentSuite) TestRewriteFromPublishesAtomicallyLeavingNoTemp() {
+	src, err := Create(s.root, 10)
+	s.Require().NoError(err)
+	for i, payload := range [][]byte{segSetCommand, segDeleteCommand} {
+		_, appendErr := src.Append(uint64(10+i), payload)
+		s.Require().NoError(appendErr)
+	}
+	s.Require().NoError(src.Sync())
+
+	dst, err := RewriteFrom(s.root, src, 10, segMaxRecordBytes)
+	s.Require().NoError(err)
+	s.Require().NoError(dst.Close())
+	s.Require().NoError(src.Close())
+
+	_, statErr := os.Stat(filepath.Join(s.dir, Name(10)))
+	s.Require().NoError(statErr, "the canonical segment is published")
+	_, tempErr := os.Stat(filepath.Join(s.dir, Name(10)+TempSuffix))
+	s.Require().True(os.IsNotExist(tempErr), "no temp file remains after a successful rewrite")
+}
+
+func (s *SegmentSuite) TestRewriteFromOverwritesStaleTemp() {
+	src, err := Create(s.root, 1)
+	s.Require().NoError(err)
+	_, err = src.Append(1, segSetCommand)
+	s.Require().NoError(err)
+	s.Require().NoError(src.Sync())
+
+	// A leftover temp from a previous interrupted rewrite must not block O_EXCL.
+	s.Require().NoError(os.WriteFile(filepath.Join(s.dir, Name(1)+TempSuffix), []byte("stale"), 0o600))
+
+	dst, err := RewriteFrom(s.root, src, 1, segMaxRecordBytes)
+	s.Require().NoError(err)
+	s.Require().NoError(dst.Close())
+	s.Require().NoError(src.Close())
+	s.Require().Equal(uint64(1), dst.LastLSN())
+}

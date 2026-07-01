@@ -2,9 +2,13 @@ package wal
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
+
+	"github.com/barnowlsnest/go-wallib/internal/segment"
 )
 
 // TruncateSuite covers low-water-mark segment reclamation.
@@ -91,6 +95,44 @@ func (s *TruncateSuite) TestBelowFirstSegmentIsNoop() {
 
 	s.Require().Equal(before, w.segmentCount())
 	s.Require().Equal(firstBefore, w.FirstLSN())
+}
+
+func (s *TruncateSuite) TestTruncateToleratesAlreadyDeletedSegment() {
+	w := s.openWithOneRecordPerSegment() // one record per segment: bases 1..5
+	defer func() { s.Require().NoError(w.Close()) }()
+
+	s.appendN(w, 5)
+
+	// Simulate a truncate that failed partway: segment 1's file is already gone
+	// while the in-memory index still lists it.
+	s.Require().NoError(os.Remove(filepath.Join(s.dir, segment.Name(1))))
+
+	// A truncate that must delete the already-gone segment still succeeds instead
+	// of wedging on a not-exist error.
+	s.Require().NoError(w.Truncate(3))
+	s.Require().LessOrEqual(w.FirstLSN(), uint64(3))
+
+	var replayed []uint64
+	err := w.Replay(0, func(entry Entry) error {
+		replayed = append(replayed, entry.LSN)
+
+		return nil
+	})
+	s.Require().NoError(err)
+	s.Require().Equal(uint64(5), replayed[len(replayed)-1], "surviving entries still replay to the end")
+}
+
+func (s *TruncateSuite) TestTruncateHonorsCanceledContext() {
+	w, _, err := Open(s.dir, WithSyncPolicy(SyncImmediate))
+	s.Require().NoError(err)
+	defer func() { s.Require().NoError(w.Close()) }()
+
+	s.appendN(w, 2)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	s.Require().ErrorIs(w.TruncateContext(ctx, 2), context.Canceled)
 }
 
 func (s *TruncateSuite) TestTruncateAfterCloseFails() {

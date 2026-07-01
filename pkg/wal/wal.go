@@ -24,7 +24,8 @@ type WAL struct {
 	closed          chan struct{}
 	requestCh       chan *appendRequest
 	controlCh       chan chan error
-	truncateCh      chan *truncateRequest
+	truncateCh      chan *writerOpRequest
+	cutCh           chan *writerOpRequest
 	subscribeCh     chan wakeup
 	root            *os.Root
 	dir             string
@@ -55,7 +56,8 @@ func Open(dir string, opts ...Option) (w *WAL, report *RecoveryReport, err error
 		closed:      make(chan struct{}),
 		requestCh:   make(chan *appendRequest, resolved.batchSize*2),
 		controlCh:   make(chan chan error), // unbuffered: a send means the writer took it
-		truncateCh:  make(chan *truncateRequest),
+		truncateCh:  make(chan *writerOpRequest),
+		cutCh:       make(chan *writerOpRequest),
 		subscribeCh: make(chan wakeup),
 	}
 
@@ -85,6 +87,18 @@ func (w *WAL) recover() (*RecoveryReport, error) {
 	}
 
 	w.root = root
+
+	removedTemps, err := segment.RemoveStaleTempFiles(w.root, w.dir)
+	if err != nil {
+		return nil, err
+	}
+
+	if removedTemps > 0 {
+		w.opts.logger.Info("wal: removed stale rewrite temp files",
+			Field{Key: "count", Value: removedTemps},
+		)
+	}
+
 	paths, err := segment.List(w.dir)
 	if err != nil {
 		return nil, err
@@ -94,12 +108,13 @@ func (w *WAL) recover() (*RecoveryReport, error) {
 		return w.initEmptyLog()
 	}
 
-	segments, err := w.openAndScanSegments(paths)
+	report := &RecoveryReport{}
+
+	segments, err := w.openAndScanSegments(paths, report)
 	if err != nil {
 		return nil, err
 	}
 
-	report := &RecoveryReport{}
 	if truncErr := truncateTornTail(report, segments); truncErr != nil {
 		closeAll(segments)
 
@@ -155,9 +170,12 @@ func (w *WAL) initEmptyLog() (*RecoveryReport, error) {
 }
 
 // openAndScanSegments opens and validates every segment in order, scanning each
-// for records. Base LSNs must be contiguous, and only the final segment may end
-// in a torn or corrupt record.
-func (w *WAL) openAndScanSegments(paths []string) ([]openedSeg, error) {
+// for records. Base LSNs must be contiguous; the final segment alone may end in
+// a torn or corrupt record. An overlapping base LSN is the fingerprint of a cut
+// interrupted after it created seg-<K> but before it deleted the superseded
+// below-K segments (a valid header CRC rules out bit rot), so recovery finishes
+// the cut by deleting every already-collected segment and restarting at seg-<K>.
+func (w *WAL) openAndScanSegments(paths []string, report *RecoveryReport) ([]openedSeg, error) {
 	var segments []openedSeg
 	var expectedBase uint64
 
@@ -177,10 +195,12 @@ func (w *WAL) openAndScanSegments(paths []string) ([]openedSeg, error) {
 		}
 
 		if i > 0 && seg.BaseLSN() != expectedBase {
-			_ = seg.Close()
-			closeAll(segments)
+			reconciled, reconcileErr := w.reconcileBoundary(report, segments, seg, expectedBase)
+			if reconcileErr != nil {
+				return nil, reconcileErr
+			}
 
-			return nil, ErrCorrupt
+			segments = reconciled
 		}
 
 		res := seg.Scan(w.opts.maxRecordSize)
@@ -196,6 +216,38 @@ func (w *WAL) openAndScanSegments(paths []string) ([]openedSeg, error) {
 	}
 
 	return segments, nil
+}
+
+// reconcileBoundary handles a non-contiguous base LSN. A base below expectedBase
+// is an interrupted cut: because RewriteFrom publishes seg-<K> atomically (a
+// complete file is renamed into place only after it is fully fsynced), a present
+// seg-<K> is always complete, so it supersedes the collected below-K segments —
+// delete them and restart the log at seg-<K>. A base above expectedBase is a
+// genuine gap and is unrecoverable.
+func (w *WAL) reconcileBoundary(
+	report *RecoveryReport, segments []openedSeg, seg *segment.Segment, expectedBase uint64,
+) ([]openedSeg, error) {
+	if seg.BaseLSN() > expectedBase {
+		_ = seg.Close()
+		closeAll(segments)
+
+		return nil, ErrCorrupt
+	}
+
+	for _, superseded := range segments {
+		if err := w.removeOpened(report, superseded); err != nil {
+			_ = seg.Close()
+
+			return nil, err
+		}
+	}
+
+	w.opts.logger.Info("wal: reconciled interrupted cut on recovery",
+		Field{Key: "firstLSN", Value: seg.BaseLSN()},
+		Field{Key: "segmentsRemoved", Value: report.SegmentsRemoved},
+	)
+
+	return segments[:0], nil
 }
 
 // truncateTornTail chops an incomplete record off the final segment, recording
@@ -300,9 +352,17 @@ func (w *WAL) installState(segments []openedSeg, firstLSN, lastLSN uint64) error
 	}
 
 	w.active = segments[lastIdx].seg
+	activeBaseLSN := w.active.BaseLSN()
+
 	w.firstLSN = firstLSN
-	w.lastLSN = lastLSN
-	w.nextLSN = lastLSN + 1
+	// An all-empty log whose sole active segment is based above LSN 1 is the
+	// footprint of a completed cut-everything (CutOffset past LastLSN): there is no
+	// record left to derive the next LSN from, so restore it from the active
+	// segment's base. Without this, recovery would reset nextLSN to 1 and reassign
+	// already-used LSNs. For a normal (non-empty) log the active base is <= lastLSN,
+	// so both maxes are no-ops and behavior is unchanged.
+	w.lastLSN = max(lastLSN, activeBaseLSN-1)
+	w.nextLSN = max(lastLSN+1, activeBaseLSN)
 
 	return nil
 }
@@ -398,6 +458,14 @@ func (w *WAL) Truncate(upToLSN uint64) error {
 }
 
 func (w *WAL) TruncateContext(ctx context.Context, upToLSN uint64) error {
+	return w.submitBoundaryOp(ctx, w.truncateCh, upToLSN)
+}
+
+// submitBoundaryOp hands a boundary operation (Truncate or CutOffset) to the
+// writer goroutine on the given request channel and waits for its result. It
+// rejects work on a closed WAL and on an already-canceled context, then blocks
+// until the writer accepts the request, the WAL closes, or ctx is canceled.
+func (w *WAL) submitBoundaryOp(ctx context.Context, requests chan<- *writerOpRequest, upToLSN uint64) error {
 	w.closeMu.RLock()
 	closed := w.isClosed
 	w.closeMu.RUnlock()
@@ -406,15 +474,39 @@ func (w *WAL) TruncateContext(ctx context.Context, upToLSN uint64) error {
 		return ErrClosed
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	done := make(chan error, 1)
 	select {
-	case w.truncateCh <- &truncateRequest{resultCh: done, upTo: upToLSN}:
+	case requests <- &writerOpRequest{resultCh: done, upTo: upToLSN}:
 		return <-done
 	case <-w.closed:
 		return ErrClosed
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// CutOffset deletes every record with LSN below upToLSN, keeping [upToLSN,
+// lastLSN]. Unlike Truncate it can cut into the segment that contains upToLSN,
+// including the active segment, by rewriting it; whole segments entirely below
+// upToLSN are deleted. It never lowers nextLSN or lastLSN, so the log stays
+// monotonic and gapless. upToLSN at or below FirstLSN is a no-op; an upToLSN
+// past LastLSN deletes every record and leaves an empty log. It blocks until the
+// change is durable and returns ErrClosed if the WAL is closed.
+func (w *WAL) CutOffset(upToLSN uint64) error {
+	ctx, cancel := context.WithTimeout(context.Background(), w.opts.maxOperationTimeout)
+	defer cancel()
+
+	return w.CutOffsetContext(ctx, upToLSN)
+}
+
+// CutOffsetContext is CutOffset with a caller-supplied context governing how long
+// it waits for the writer goroutine to accept and complete the cut.
+func (w *WAL) CutOffsetContext(ctx context.Context, upToLSN uint64) error {
+	return w.submitBoundaryOp(ctx, w.cutCh, upToLSN)
 }
 
 // segmentCount reports how many segments make up the log. It is a test helper.

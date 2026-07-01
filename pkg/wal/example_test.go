@@ -173,3 +173,44 @@ func ExampleFollower_follow() {
 	// LSN 3: {"op":"set","key":"row:3","seq":3}
 	// LSN 4: {"op":"set","key":"row:4","seq":4}
 }
+
+// ExampleWAL_CutOffset trims the head of the log, keeping only records at or
+// above a chosen LSN. Unlike Truncate, it can cut into the active segment.
+func ExampleWAL_CutOffset() {
+	dir, err := os.MkdirTemp("", "wal-cut-*")
+	if err != nil {
+		panic(err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	w, _, err := Open(dir, WithSyncPolicy(SyncImmediate))
+	if err != nil {
+		panic(err)
+	}
+	defer func() { _ = w.Close() }()
+
+	for i := 1; i <= 5; i++ {
+		if _, appendErr := w.Append(context.Background(), payloadForLSN(uint64(i))); appendErr != nil {
+			panic(appendErr)
+		}
+	}
+
+	// Drop every record below LSN 3; records 3, 4, 5 remain.
+	if err := w.CutOffset(3); err != nil {
+		panic(err)
+	}
+
+	fmt.Println("FirstLSN:", w.FirstLSN())
+	if replayErr := w.Replay(0, func(entry Entry) error {
+		fmt.Printf("LSN %d: %s\n", entry.LSN, entry.Payload)
+
+		return nil
+	}); replayErr != nil {
+		panic(replayErr)
+	}
+	// Output:
+	// FirstLSN: 3
+	// LSN 3: {"op":"set","key":"row:3","seq":3}
+	// LSN 4: {"op":"set","key":"row:4","seq":4}
+	// LSN 5: {"op":"set","key":"row:5","seq":5}
+}
