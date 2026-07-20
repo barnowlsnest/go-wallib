@@ -1,9 +1,9 @@
 module github.com/barnowlsnest/go-wallib
 
-go 1.26.2
+go 1.26.5
 
 require (
-	github.com/barnowlsnest/go-logslib/v2 v2.0.0
+	github.com/barnowlsnest/go-logslib/v2 v2.2.0
 	github.com/stretchr/testify v1.11.1
 	go.uber.org/goleak v1.3.0
 )
