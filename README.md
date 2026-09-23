@@ -31,7 +31,7 @@ Update Queue.
 go get github.com/barnowlsnest/go-wal/pkg/wal
 ```
 
-Requires Go 1.26 or newer.
+Requires Go 1.27 or newer.
 
 ## Usage
 

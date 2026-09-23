@@ -1,6 +1,6 @@
 module github.com/barnowlsnest/go-wallib
 
-go 1.26.5
+go 1.27.1
 
 require (
 	github.com/barnowlsnest/go-logslib/v2 v2.2.0

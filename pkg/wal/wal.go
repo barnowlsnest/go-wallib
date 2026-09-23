@@ -123,7 +123,7 @@ func (w *WAL) recover() (*RecoveryReport, error) {
 
 	if report.BytesTruncated > 0 {
 		w.opts.logger.Info("wal: truncated torn tail on recovery",
-			Field{Key: "bytesTruncated", Value: report.BytesTruncated},
+			Field{Key: logKeyBytesTruncated, Value: report.BytesTruncated},
 		)
 	}
 
@@ -143,10 +143,10 @@ func (w *WAL) recover() (*RecoveryReport, error) {
 
 	w.opts.logger.Info("wal: recovery complete",
 		Field{Key: "entriesRecovered", Value: report.EntriesRecovered},
-		Field{Key: "firstLSN", Value: report.FirstLSN},
+		Field{Key: logKeyFirstLSN, Value: report.FirstLSN},
 		Field{Key: "lastLSN", Value: report.LastLSN},
-		Field{Key: "bytesTruncated", Value: report.BytesTruncated},
-		Field{Key: "segmentsRemoved", Value: report.SegmentsRemoved},
+		Field{Key: logKeyBytesTruncated, Value: report.BytesTruncated},
+		Field{Key: logKeySegmentsRemoved, Value: report.SegmentsRemoved},
 		Field{Key: "segments", Value: len(segments)},
 	)
 
@@ -243,8 +243,8 @@ func (w *WAL) reconcileBoundary(
 	}
 
 	w.opts.logger.Info("wal: reconciled interrupted cut on recovery",
-		Field{Key: "firstLSN", Value: seg.BaseLSN()},
-		Field{Key: "segmentsRemoved", Value: report.SegmentsRemoved},
+		Field{Key: logKeyFirstLSN, Value: seg.BaseLSN()},
+		Field{Key: logKeySegmentsRemoved, Value: report.SegmentsRemoved},
 	)
 
 	return segments[:0], nil
@@ -330,7 +330,7 @@ func (w *WAL) removeOpened(report *RecoveryReport, opened openedSeg) error {
 
 	w.opts.logger.Debug("wal: removed empty trailing segment",
 		Field{Key: "segment", Value: name},
-		Field{Key: "baseLSN", Value: baseLSN},
+		Field{Key: logKeyBaseLSN, Value: baseLSN},
 	)
 
 	return segment.SyncDir(w.dir)
