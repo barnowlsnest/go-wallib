@@ -1,9 +1,25 @@
 # go-wallib
 
+[![Build](https://github.com/barnowlsnest/go-wal/actions/workflows/build.yml/badge.svg)](https://github.com/barnowlsnest/go-wal/actions/workflows/build.yml)
+[![Lint](https://github.com/barnowlsnest/go-wal/actions/workflows/lint.yml/badge.svg)](https://github.com/barnowlsnest/go-wal/actions/workflows/lint.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/barnowlsnest/go-wallib/pkg/wal.svg)](https://pkg.go.dev/github.com/barnowlsnest/go-wallib/pkg/wal)
+[![Go Version](https://img.shields.io/badge/Go-%3E%3D%201.27-00ADD8?logo=go)](https://go.dev/dl/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A production-ready Write-Ahead Log library for Go: append-only, durable, and
 crash-safe, with monotonic Log Sequence Numbers, CRC32C-checksummed records,
 size-rolled segment files, low-water-mark cleanup, and a single-writer Singular
 Update Queue.
+
+> **Module path:** `github.com/barnowlsnest/go-wallib`  
+> **Repository:** [github.com/barnowlsnest/go-wal](https://github.com/barnowlsnest/go-wal)
+
+## Status
+
+The library is used as a durable append log with crash recovery, segmentation,
+and retention under caller control. The public API in `pkg/wal` is stable for
+normal use; please open an issue before relying on undocumented internals under
+`internal/`.
 
 ## Features
 
@@ -16,22 +32,24 @@ Update Queue.
 - **Configurable durability** via `SyncPolicy`: `SyncImmediate`, `SyncBatched`
   (group commit), or `SyncInterval` (periodic background fsync).
 - **Segmentation & cleanup.** The log rolls into size-bounded segments; a record
-  is never split across files. `Truncate` reclaims whole obsolete segments at a
-  low-water mark.
+  is never split across files. `Truncate` reclaims whole obsolete segments;
+  `CutOffset` precisely drops every record below an LSN (rewriting the boundary
+  segment when needed).
 - **Single writer (Singular Update Queue).** One goroutine serializes and
   batches all writes; the API is safe for concurrent use.
-- **Readers & replay.** A forward `Reader` cursor and `Replay` callback iterate
-  committed entries from any LSN.
+- **Readers, replay & followers.** A forward `Reader` cursor, `Replay`
+  callback, and `Follower` (`iter.Seq2` / channel) iterate committed entries
+  from any LSN — including live follow mode.
 - Standard library only (plus an optional structured logger); no `unsafe`; all
   file access is confined to the log directory via `os.Root`.
 
 ## Install
 
 ```bash
-go get github.com/barnowlsnest/go-wal/pkg/wal
+go get github.com/barnowlsnest/go-wallib/pkg/wal
 ```
 
-Requires Go 1.27 or newer.
+Requires **Go 1.27** or newer.
 
 ## Usage
 
@@ -42,7 +60,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/barnowlsnest/go-wal/pkg/wal"
+	"github.com/barnowlsnest/go-wallib/pkg/wal"
 )
 
 func main() {
@@ -76,6 +94,8 @@ func main() {
 	}
 }
 ```
+
+Full API docs: [pkg.go.dev/github.com/barnowlsnest/go-wallib/pkg/wal](https://pkg.go.dev/github.com/barnowlsnest/go-wallib/pkg/wal).
 
 ## Following the log
 
@@ -130,20 +150,25 @@ There is **no automatic retention policy**. The log grows until the application
 explicitly reclaims space — there is no TTL, no size-based expiry, and no
 background purge goroutine.
 
-Retention is **caller-driven** via `Truncate(upToLSN)` after you no longer need
-records at or below that LSN. The usual pattern is to persist a snapshot or
-checkpoint, then truncate at that LSN:
+Retention is **caller-driven**:
+
+| API | Behavior |
+|-----|----------|
+| `Truncate(upToLSN)` | Deletes **whole closed segment files** entirely below the LSN. Advances `FirstLSN`. The **active segment is never deleted**, so some entries below `upToLSN` may remain readable. |
+| `CutOffset(upToLSN)` | Drops **every** record below the LSN, rewriting the boundary segment (including the active one) when needed. Precise front-cut; LSN numbering stays monotonic and gapless. |
+
+Typical pattern after a snapshot or checkpoint:
 
 ```go
 if err := w.Truncate(snapshotLSN); err != nil {
     panic(err)
 }
-```
 
-`Truncate` deletes **whole closed segment files** and advances `FirstLSN` (the
-low-water mark). The **active segment is never deleted**, so entries below
-`upToLSN` that still live in a surviving segment remain readable — truncation is
-segment-granular best-effort reclamation, not a precise per-entry delete.
+// Or, when you need a precise cut into the active segment:
+if err := w.CutOffset(snapshotLSN); err != nil {
+    panic(err)
+}
+```
 
 `WithMaxSegmentSize` only controls when new segment files are created during
 rolling; it does **not** delete old data. On `Open`, recovery may truncate a
@@ -174,13 +199,13 @@ committed and never consumes an LSN.
 ## Options
 
 ```go
-wal.WithSyncPolicy(wal.SyncBatched)      // durability policy (default SyncBatched)
-wal.WithMaxSegmentSize(64 << 20)         // soft roll threshold, bytes (default 64 MiB)
-wal.WithMaxRecordSize(64 << 20)          // hard per-record limit, bytes (default 64 MiB)
-wal.WithBatchSize(256)                    // max appends coalesced per commit
-wal.WithBatchTimeout(2 * time.Millisecond)   // group-commit linger (SyncBatched)
+wal.WithSyncPolicy(wal.SyncBatched)           // durability policy (default SyncBatched)
+wal.WithMaxSegmentSize(64 << 20)              // soft roll threshold, bytes (default 64 MiB)
+wal.WithMaxRecordSize(64 << 20)               // hard per-record limit, bytes (default 64 MiB)
+wal.WithBatchSize(256)                        // max appends coalesced per commit
+wal.WithBatchTimeout(2 * time.Millisecond)    // group-commit linger (SyncBatched)
 wal.WithFlushInterval(100 * time.Millisecond) // background fsync period (SyncInterval)
-wal.WithLogger(logger)                    // structured logger (default: no-op)
+wal.WithLogger(logger)                        // structured logger (default: no-op)
 ```
 
 ## Logging
@@ -205,6 +230,34 @@ CRC32C (Castagnoli) computed over `Length || LSN || Payload`. All integers are
 little-endian. Segment filenames are the zero-padded base LSN (e.g.
 `00000000000000000001.wal`).
 
+## Development
+
+Prerequisites: Go 1.27+, [Task](https://taskfile.dev), and
+[golangci-lint](https://golangci-lint.run/) (for lint).
+
+```bash
+git clone https://github.com/barnowlsnest/go-wal.git
+cd go-wal
+
+task go-test    # race + coverage
+task go-lint    # golangci-lint
+task sanity     # tidy, fmt, vet, lint, test
+task build      # sanity + build
+```
+
+CI runs build/test and lint on every push and pull request to `main`.
+
+## Contributing
+
+Bug reports, fixes, and improvements are welcome.
+
+1. Open an issue for larger changes so we can agree on the approach.
+2. Keep PRs focused; match existing style and package boundaries (`pkg/wal` is
+   the public surface; `internal/` is not).
+3. Run `task sanity` before opening a pull request.
+4. Prefer tests that cover crash/recovery, retention, and concurrency when
+   touching those paths.
+
 ## License
 
-MIT
+Released under the [MIT License](LICENSE). Copyright (c) 2026 Barn Owls Nest.
