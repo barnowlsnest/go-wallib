@@ -24,6 +24,17 @@ const (
 // Logger directly, without any adapter.
 type Field = logger.Field
 
+// Structured log field keys reused across recovery, truncate, and cut paths.
+const (
+	logKeyBaseLSN         = "baseLSN"
+	logKeyBytesTruncated  = "bytesTruncated"
+	logKeyError           = "error"
+	logKeyFirstLSN        = "firstLSN"
+	logKeySegmentsDeleted = "segmentsDeleted"
+	logKeySegmentsRemoved = "segmentsRemoved"
+	logKeyUpTo            = "upTo"
+)
+
 // Logger is the structured logging hook used by the WAL. Its method set is a
 // subset of go-logslib's *logger.Logger, so an instance of that logger can be
 // passed to WithLogger as-is.

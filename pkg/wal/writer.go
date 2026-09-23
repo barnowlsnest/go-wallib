@@ -407,7 +407,7 @@ func (w *WAL) doTruncate(upTo uint64) error {
 		}
 
 		w.opts.logger.Debug("wal: deleted truncated segment",
-			Field{Key: "baseLSN", Value: baseLSNs[i]},
+			Field{Key: logKeyBaseLSN, Value: baseLSNs[i]},
 		)
 	}
 
@@ -418,9 +418,9 @@ func (w *WAL) doTruncate(upTo uint64) error {
 	w.mu.Unlock()
 
 	w.opts.logger.Info("wal: truncated log",
-		Field{Key: "segmentsDeleted", Value: deletable},
-		Field{Key: "upTo", Value: upTo},
-		Field{Key: "firstLSN", Value: newFirstLSN},
+		Field{Key: logKeySegmentsDeleted, Value: deletable},
+		Field{Key: logKeyUpTo, Value: upTo},
+		Field{Key: logKeyFirstLSN, Value: newFirstLSN},
 	)
 
 	return nil
@@ -447,7 +447,7 @@ func (w *WAL) finalFlush() {
 	}
 
 	if err := w.active.Sync(); err != nil {
-		w.opts.logger.Error("wal: final flush failed", Field{Key: "error", Value: err.Error()})
+		w.opts.logger.Error("wal: final flush failed", Field{Key: logKeyError, Value: err.Error()})
 	}
 }
 
@@ -478,7 +478,7 @@ func (w *WAL) requestIntervalFlush() {
 	select {
 	case w.controlCh <- done:
 		if err := <-done; err != nil {
-			w.opts.logger.Error("wal: interval flush failed", Field{Key: "error", Value: err.Error()})
+			w.opts.logger.Error("wal: interval flush failed", Field{Key: logKeyError, Value: err.Error()})
 		}
 	case <-w.closed:
 	}
@@ -537,7 +537,7 @@ func (w *WAL) cutDeleteBelow(baseLSNs []uint64, boundary int, cut uint64) error 
 			return err
 		}
 
-		w.opts.logger.Debug("wal: cut deleted segment", Field{Key: "baseLSN", Value: baseLSNs[i]})
+		w.opts.logger.Debug("wal: cut deleted segment", Field{Key: logKeyBaseLSN, Value: baseLSNs[i]})
 	}
 
 	w.mu.Lock()
@@ -643,7 +643,7 @@ func (w *WAL) cutEverything(baseLSNs []uint64, nextLSN uint64) error {
 	}
 
 	w.opts.logger.Info("wal: cut entire log",
-		Field{Key: "segmentsDeleted", Value: len(baseLSNs)},
+		Field{Key: logKeySegmentsDeleted, Value: len(baseLSNs)},
 		Field{Key: "newActiveBaseLSN", Value: nextLSN},
 	)
 
@@ -654,9 +654,9 @@ func (w *WAL) cutEverything(baseLSNs []uint64, nextLSN uint64) error {
 // cut paths.
 func (w *WAL) logCut(cut uint64, boundary int, boundaryRewritten bool) {
 	w.opts.logger.Info("wal: cut log",
-		Field{Key: "upTo", Value: cut},
-		Field{Key: "firstLSN", Value: cut},
-		Field{Key: "segmentsDeleted", Value: boundary},
+		Field{Key: logKeyUpTo, Value: cut},
+		Field{Key: logKeyFirstLSN, Value: cut},
+		Field{Key: logKeySegmentsDeleted, Value: boundary},
 		Field{Key: "boundaryRewritten", Value: boundaryRewritten},
 	)
 }
