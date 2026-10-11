@@ -1,7 +1,7 @@
 # go-wallib
 
-[![Build](https://github.com/barnowlsnest/go-wallib/actions/workflows/build.yml/badge.svg)](https://github.com/barnowlsnest/go-wallib/actions/workflows/build.yml)
-[![Lint](https://github.com/barnowlsnest/go-wallib/actions/workflows/lint.yml/badge.svg)](https://github.com/barnowlsnest/go-wallib/actions/workflows/lint.yml)
+[![Build](https://github.com/barnowlsnest/go-wal/actions/workflows/build.yml/badge.svg)](https://github.com/barnowlsnest/go-wal/actions/workflows/build.yml)
+[![Lint](https://github.com/barnowlsnest/go-wal/actions/workflows/lint.yml/badge.svg)](https://github.com/barnowlsnest/go-wal/actions/workflows/lint.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/barnowlsnest/go-wallib/pkg/wal.svg)](https://pkg.go.dev/github.com/barnowlsnest/go-wallib/pkg/wal)
 [![Go Version](https://img.shields.io/badge/Go-%3E%3D%201.27.1-00ADD8?logo=go)](https://go.dev/dl/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -12,7 +12,7 @@ size-rolled segment files, low-water-mark cleanup, and a single-writer Singular
 Update Queue.
 
 > **Module path:** `github.com/barnowlsnest/go-wallib`  
-> **Repository:** [github.com/barnowlsnest/go-wallib](https://github.com/barnowlsnest/go-wallib)
+> **Repository:** [github.com/barnowlsnest/go-wal](https://github.com/barnowlsnest/go-wal)
 
 ## Status
 
@@ -255,8 +255,8 @@ Prerequisites: Go 1.27.1+, [Task](https://taskfile.dev), and
 [golangci-lint](https://golangci-lint.run/) (for lint).
 
 ```bash
-git clone https://github.com/barnowlsnest/go-wallib.git
-cd go-wallib
+git clone https://github.com/barnowlsnest/go-wal.git
+cd go-wal
 
 task go-test    # race + coverage
 task go-lint    # golangci-lint
