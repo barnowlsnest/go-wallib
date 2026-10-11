@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/barnowlsnest/go-wallib/internal/record"
 	"github.com/barnowlsnest/go-wallib/internal/segment"
@@ -101,7 +102,9 @@ func (r *Reader) Next() bool {
 }
 
 // accept decides whether a scanned record falls within the reader's window. A
-// record above endLSN ends the cursor (it is beyond our snapshot).
+// record above endLSN ends the cursor (it is beyond our snapshot). The window's
+// lower bound advances past every accepted record, so records a concurrent cut
+// briefly duplicates across seg-<cut> and the old boundary are yielded once.
 func (r *Reader) accept(scanned record.Record) (Entry, bool) {
 	switch {
 	case scanned.LSN < r.fromLSN:
@@ -111,11 +114,16 @@ func (r *Reader) accept(scanned record.Record) (Entry, bool) {
 
 		return Entry{}, false
 	default:
+		r.fromLSN = scanned.LSN + 1
+
 		return Entry{LSN: scanned.LSN, Payload: scanned.Payload}, true
 	}
 }
 
-// openNext opens the next segment, skipping any deleted by a concurrent Truncate.
+// openNext opens the next segment. A segment deleted since the snapshot was
+// either reclaimed by a concurrent Truncate or rewritten by a concurrent
+// CutOffset into a seg-<cut> the snapshot does not name, so the remaining
+// segments are re-listed from the directory rather than trusted.
 func (r *Reader) openNext() bool {
 	for r.index < len(r.segmentNames) {
 		name := r.segmentNames[r.index]
@@ -124,7 +132,13 @@ func (r *Reader) openNext() bool {
 		file, err := os.OpenInRoot(r.dir, name)
 		if err != nil {
 			if os.IsNotExist(err) {
-				continue // reclaimed by a concurrent Truncate; skip it
+				if err := r.relistAfter(name); err != nil {
+					r.fail(err)
+
+					return false
+				}
+
+				continue
 			}
 
 			r.fail(err)
@@ -148,6 +162,31 @@ func (r *Reader) openNext() bool {
 	r.finish()
 
 	return false
+}
+
+// relistAfter replaces the remaining snapshot with every segment now on disk
+// whose base LSN is above the missing one. A cut creates seg-<cut> durably before
+// deleting the segment it replaces, so its records are always found here.
+func (r *Reader) relistAfter(missing string) error {
+	missingBase, _ := segment.ParseBaseLSN(missing)
+
+	paths, err := segment.List(r.dir)
+	if err != nil {
+		return err
+	}
+
+	remaining := make([]string, 0, len(paths))
+	for _, path := range paths {
+		name := filepath.Base(path)
+		if base, _ := segment.ParseBaseLSN(name); base > missingBase {
+			remaining = append(remaining, name)
+		}
+	}
+
+	r.segmentNames = remaining
+	r.index = 0
+
+	return nil
 }
 
 // closeCurrent closes the open segment so the next one can be read.
