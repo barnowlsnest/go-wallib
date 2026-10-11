@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
+
+	"github.com/barnowlsnest/go-wallib/internal/segment"
 )
 
 // ReaderSuite covers the forward Reader cursor and Replay.
@@ -159,4 +162,57 @@ func (s *ReaderSuite) TestReaderSnapshotReportsBounds() {
 	s.Require().NotEmpty(segmentNames)
 	s.Assert().Equal(uint64(3), endLSN)
 	s.Assert().Equal(uint64(1), firstLSN)
+}
+
+func (s *ReaderSuite) TestReaderSeesRecordsMovedByConcurrentCut() {
+	w := s.appendSequential(100)
+	defer func() { _ = w.Close() }()
+
+	// The snapshot names only the active seg-1; the cut rewrites it into seg-40
+	// and deletes seg-1 before the reader opens anything.
+	reader, err := w.NewReader(50)
+	s.Require().NoError(err)
+	defer func() { _ = reader.Close() }()
+
+	s.Require().NoError(w.CutOffset(40))
+
+	entries := s.collect(reader)
+	s.Require().Len(entries, 51, "records 50..100 survive the cut and must be read")
+
+	for i, entry := range entries {
+		lsn := uint64(50 + i)
+		s.Assert().Equal(lsn, entry.LSN)
+		s.Assert().Equal(payloadForLSN(lsn), entry.Payload)
+	}
+}
+
+func (s *ReaderSuite) TestReaderSkipsOverlapLeftByInProgressCut() {
+	w := s.appendSequential(10)
+	maxRecord := w.opts.maxRecordSize
+	s.Require().NoError(w.Close())
+
+	// Mid-cut state: seg-5 has been written but the old boundary seg-1 is not yet
+	// deleted, so LSNs 5..10 exist in both files.
+	root, err := os.OpenRoot(s.dir)
+	s.Require().NoError(err)
+	defer func() { _ = root.Close() }()
+
+	source, err := segment.Open(root, 1)
+	s.Require().NoError(err)
+	replacement, err := segment.RewriteFrom(root, source, 5, maxRecord)
+	s.Require().NoError(err)
+	s.Require().NoError(replacement.Close())
+	s.Require().NoError(source.Close())
+
+	// A snapshot segment that has vanished forces the reader to re-list the
+	// directory, where it finds both overlapping segments.
+	reader := newReaderFrom(s.dir, []string{segment.Name(0)}, 0, 10, maxRecord)
+	defer func() { _ = reader.Close() }()
+
+	entries := s.collect(reader)
+	s.Require().Len(entries, 10, "overlapping records must be yielded once")
+
+	for i, entry := range entries {
+		s.Assert().Equal(uint64(i+1), entry.LSN)
+	}
 }
