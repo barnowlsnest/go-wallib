@@ -44,12 +44,8 @@ type Follower struct {
 // (0 means from the beginning). Options select snapshot (default) vs. follow mode.
 // It returns ErrClosed if the WAL is closed.
 func (w *WAL) Follower(fromLSN uint64, opts ...FollowerOption) (*Follower, error) {
-	w.closeMu.RLock()
-	closed := w.isClosed
-	w.closeMu.RUnlock()
-
-	if closed {
-		return nil, ErrClosed
+	if err := w.checkOpen(); err != nil {
+		return nil, err
 	}
 
 	cfg := followerConfig{}

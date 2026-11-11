@@ -58,12 +58,8 @@ func newReaderFrom(dir string, segmentNames []string, fromLSN, endLSN uint64, ma
 // the beginning), up to the last committed LSN at the time of this call. Entries
 // committed after this call are not observed.
 func (w *WAL) NewReader(fromLSN uint64) (*Reader, error) {
-	w.closeMu.RLock()
-	closed := w.isClosed
-	w.closeMu.RUnlock()
-
-	if closed {
-		return nil, ErrClosed
+	if err := w.checkOpen(); err != nil {
+		return nil, err
 	}
 
 	segmentNames, endLSN, _ := w.readerSnapshot()
