@@ -132,7 +132,7 @@ func (w *WAL) recover() (*RecoveryReport, error) {
 	report.FirstLSN = firstLSN
 	report.LastLSN = lastLSN
 
-	segments, err = w.pruneEmptyTrailing(report, segments, lastLSN)
+	segments, err = w.pruneEmptyTrailing(report, segments)
 	if err != nil {
 		return nil, err
 	}
@@ -280,35 +280,15 @@ func computeBounds(segments []openedSeg) (firstLSN, lastLSN, total uint64) {
 	return firstLSN, lastLSN, total
 }
 
-// pruneEmptyTrailing deletes empty trailing segments above the active one, and
-// for an all-empty log collapses to a single empty active segment.
-func (w *WAL) pruneEmptyTrailing(
-	report *RecoveryReport, segments []openedSeg, lastLSN uint64,
-) ([]openedSeg, error) {
-	activeIdx := len(segments) - 1
-	for i := len(segments) - 1; i >= 0; i-- {
-		if segments[i].res.Records > 0 {
-			activeIdx = i
-
-			break
-		}
-	}
-
-	for i := len(segments) - 1; i > activeIdx; i-- {
-		if err := w.removeOpened(report, segments[i]); err != nil {
+// pruneEmptyTrailing deletes empty trailing segments above the last non-empty
+// one, always keeping at least one segment to serve as the active segment.
+func (w *WAL) pruneEmptyTrailing(report *RecoveryReport, segments []openedSeg) ([]openedSeg, error) {
+	for len(segments) > 1 && segments[len(segments)-1].res.Records == 0 {
+		if err := w.removeOpened(report, segments[len(segments)-1]); err != nil {
 			return nil, err
 		}
-	}
-	segments = segments[:activeIdx+1]
 
-	if lastLSN == 0 {
-		for i := 1; i < len(segments); i++ {
-			if err := w.removeOpened(report, segments[i]); err != nil {
-				return nil, err
-			}
-		}
-
-		segments = segments[:1]
+		segments = segments[:len(segments)-1]
 	}
 
 	return segments, nil
@@ -322,33 +302,34 @@ func (w *WAL) removeOpened(report *RecoveryReport, opened openedSeg) error {
 		return err
 	}
 
-	if err := w.root.Remove(name); err != nil {
+	if err := w.removeSegmentFile(baseLSN); err != nil {
 		return err
 	}
 
 	report.SegmentsRemoved++
 
-	w.opts.logger.Debug("wal: removed empty trailing segment",
+	w.opts.logger.Debug("wal: removed segment on recovery",
 		Field{Key: "segment", Value: name},
 		Field{Key: logKeyBaseLSN, Value: baseLSN},
 	)
 
-	return segment.SyncDir(w.dir)
+	return nil
 }
 
 // installState records the recovered segment index and bounds, keeping only the
 // active (last) segment open; readers reopen the rest on demand.
 func (w *WAL) installState(segments []openedSeg, firstLSN, lastLSN uint64) error {
 	lastIdx := len(segments) - 1
-	for i := 0; i < lastIdx; i++ {
-		if err := segments[i].seg.Close(); err != nil {
-			return err
-		}
-	}
-
 	w.segmentBaseLSNs = make([]uint64, len(segments))
 	for i, opened := range segments {
 		w.segmentBaseLSNs[i] = opened.seg.BaseLSN()
+		if i == lastIdx {
+			break
+		}
+
+		if err := opened.seg.Close(); err != nil {
+			return err
+		}
 	}
 
 	w.active = segments[lastIdx].seg
@@ -360,7 +341,8 @@ func (w *WAL) installState(segments []openedSeg, firstLSN, lastLSN uint64) error
 	// record left to derive the next LSN from, so restore it from the active
 	// segment's base. Without this, recovery would reset nextLSN to 1 and reassign
 	// already-used LSNs. For a normal (non-empty) log the active base is <= lastLSN,
-	// so both maxes are no-ops and behavior is unchanged.
+	// so both maxes are no-ops and behavior is unchanged. lastLSN is computed on its
+	// own rather than as nextLSN-1 so a recovered LSN of math.MaxUint64 is kept.
 	w.lastLSN = max(lastLSN, activeBaseLSN-1)
 	w.nextLSN = max(lastLSN+1, activeBaseLSN)
 
@@ -383,6 +365,18 @@ func joinCorrupt(err error) error {
 	}
 
 	return err
+}
+
+// checkOpen returns ErrClosed once Close has begun.
+func (w *WAL) checkOpen() error {
+	w.closeMu.RLock()
+	defer w.closeMu.RUnlock()
+
+	if w.isClosed {
+		return ErrClosed
+	}
+
+	return nil
 }
 
 // FirstLSN returns the lowest available LSN, or 0 if the log is empty.
@@ -427,12 +421,8 @@ func (w *WAL) Sync() error {
 }
 
 func (w *WAL) SyncContext(ctx context.Context) error {
-	w.closeMu.RLock()
-	closed := w.isClosed
-	w.closeMu.RUnlock()
-
-	if closed {
-		return ErrClosed
+	if err := w.checkOpen(); err != nil {
+		return err
 	}
 
 	done := make(chan error, 1)
@@ -466,12 +456,8 @@ func (w *WAL) TruncateContext(ctx context.Context, upToLSN uint64) error {
 // rejects work on a closed WAL and on an already-canceled context, then blocks
 // until the writer accepts the request, the WAL closes, or ctx is canceled.
 func (w *WAL) submitBoundaryOp(ctx context.Context, requests chan<- *writerOpRequest, upToLSN uint64) error {
-	w.closeMu.RLock()
-	closed := w.isClosed
-	w.closeMu.RUnlock()
-
-	if closed {
-		return ErrClosed
+	if err := w.checkOpen(); err != nil {
+		return err
 	}
 
 	if err := ctx.Err(); err != nil {
