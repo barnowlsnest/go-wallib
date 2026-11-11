@@ -341,9 +341,10 @@ func (w *WAL) installState(segments []openedSeg, firstLSN, lastLSN uint64) error
 	// record left to derive the next LSN from, so restore it from the active
 	// segment's base. Without this, recovery would reset nextLSN to 1 and reassign
 	// already-used LSNs. For a normal (non-empty) log the active base is <= lastLSN,
-	// so the max is a no-op and behavior is unchanged.
+	// so both maxes are no-ops and behavior is unchanged. lastLSN is computed on its
+	// own rather than as nextLSN-1 so a recovered LSN of math.MaxUint64 is kept.
+	w.lastLSN = max(lastLSN, activeBaseLSN-1)
 	w.nextLSN = max(lastLSN+1, activeBaseLSN)
-	w.lastLSN = w.nextLSN - 1
 
 	return nil
 }
