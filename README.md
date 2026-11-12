@@ -11,6 +11,10 @@ crash-safe, with monotonic Log Sequence Numbers, CRC32C-checksummed records,
 size-rolled segment files, low-water-mark cleanup, and a single-writer Singular
 Update Queue.
 
+<p align="center">
+  <img src="assets/wal.svg" alt="Animated overview: concurrent appends go through a single writer that assigns LSNs, fsyncs once per batch and writes CRC32C-framed records into size-rolled segment files; a follower tails committed records and Truncate deletes old segments." width="100%">
+</p>
+
 > **Module path:** `github.com/barnowlsnest/go-wallib`  
 > **Repository:** [github.com/barnowlsnest/go-wal](https://github.com/barnowlsnest/go-wal)
 
