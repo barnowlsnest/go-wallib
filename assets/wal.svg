@@ -1,0 +1,224 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 470" width="960" height="470" role="img" aria-labelledby="t d">
+<title id="t">How go-wal works</title>
+<desc id="d">Concurrent appends go through a single writer that assigns LSNs, fsyncs once per batch and writes CRC32C-framed records into size-rolled segment files. A follower tails committed records and Truncate deletes old segments.</desc>
+<style>
+:root{--bg:#fafaf7;--fg:#1f2328;--muted:#6e7781;--line:#d0d7de;--panel:#ffffff;
+--accent:#0a7ea4;--pk:#e3f4fa;--rec:#eef6ec;--recs:#3f8f4f;--crc:#d97706;--len:#7c3aed;
+--lsn:#00a3c4;--pay:#b0b7c0;--fol:#d6246e;--danger:#cf222e;--ok:#1a7f37}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#8b949e;
+--line:#30363d;--panel:#161b22;--accent:#4cc3e0;--pk:#0e3442;--rec:#11261a;--recs:#3fb950;
+--crc:#f0a73a;--len:#a78bfa;--lsn:#22c3e6;--pay:#57606a;--fol:#f0609e;--danger:#ff7b72;--ok:#3fb950}}
+text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;fill:var(--fg)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.muted{fill:var(--muted)} .s11{font-size:11px} .s12{font-size:12px} .s13{font-size:13px}
+.panel{fill:var(--panel);stroke:var(--line);stroke-width:1.2}
+.arrow{stroke:var(--muted);stroke-width:1.4;fill:none;marker-end:url(#ah)}
+.pkr{fill:var(--pk);stroke:var(--accent);stroke-width:1.4}
+.recr{fill:var(--rec);stroke:var(--recs);stroke-width:1.2}
+.b-crc{fill:var(--crc)} .b-len{fill:var(--len)} .b-lsn{fill:var(--lsn)} .b-pay{fill:var(--pay)}
+.fol{fill:none;stroke:var(--fol);stroke-width:2.4}
+.ack{fill:var(--ok);font-weight:600}
+.danger{fill:var(--danger);font-weight:600}
+.ring{fill:none;stroke:var(--accent);stroke-width:2;transform-box:fill-box;transform-origin:center}
+
+@keyframes scene{0%{opacity:0} 2%,95%{opacity:1} 98%,100%{opacity:0}}
+.scene{animation:scene 16s linear infinite}
+@keyframes pA{0%,1%{transform:translate(180px,96px);opacity:0} 2%{transform:translate(180px,96px);opacity:1} 8%,18%{transform:translate(229px,150px);opacity:1} 24%{transform:translate(458px,156px);opacity:1} 26%,100%{transform:translate(458px,156px);opacity:0}}
+.pA{animation:pA 16s linear infinite}
+@keyframes pAd{0%,13%{opacity:1} 14%,100%{opacity:0}}
+.pAd{animation:pAd 16s linear infinite}
+@keyframes pAl{0%,13%{opacity:0} 14%,100%{opacity:1}}
+.pAl{animation:pAl 16s linear infinite}
+@keyframes pB{0%,3%{transform:translate(180px,156px);opacity:0} 4%{transform:translate(180px,156px);opacity:1} 10%,18%{transform:translate(293px,150px);opacity:1} 24%{transform:translate(458px,156px);opacity:1} 26%,100%{transform:translate(458px,156px);opacity:0}}
+.pB{animation:pB 16s linear infinite}
+@keyframes pBd{0%,13%{opacity:1} 14%,100%{opacity:0}}
+.pBd{animation:pBd 16s linear infinite}
+@keyframes pBl{0%,13%{opacity:0} 14%,100%{opacity:1}}
+.pBl{animation:pBl 16s linear infinite}
+@keyframes pC{0%,5%{transform:translate(180px,216px);opacity:0} 6%{transform:translate(180px,216px);opacity:1} 12%,18%{transform:translate(357px,150px);opacity:1} 24%{transform:translate(458px,156px);opacity:1} 26%,100%{transform:translate(458px,156px);opacity:0}}
+.pC{animation:pC 16s linear infinite}
+@keyframes pCd{0%,13%{opacity:1} 14%,100%{opacity:0}}
+.pCd{animation:pCd 16s linear infinite}
+@keyframes pCl{0%,13%{opacity:0} 14%,100%{opacity:1}}
+.pCl{animation:pCl 16s linear infinite}
+@keyframes pD{0%,39%{transform:translate(180px,96px);opacity:0} 40%{transform:translate(180px,96px);opacity:1} 46%,52%{transform:translate(229px,150px);opacity:1} 55%{transform:translate(458px,156px);opacity:1} 57%,100%{transform:translate(458px,156px);opacity:0}}
+.pD{animation:pD 16s linear infinite}
+@keyframes pDd{0%,48%{opacity:1} 49%,100%{opacity:0}}
+.pDd{animation:pDd 16s linear infinite}
+@keyframes pDl{0%,48%{opacity:0} 49%,100%{opacity:1}}
+.pDl{animation:pDl 16s linear infinite}
+@keyframes pE{0%,61%{transform:translate(180px,216px);opacity:0} 62%{transform:translate(180px,216px);opacity:1} 66%,70%{transform:translate(229px,150px);opacity:1} 72%{transform:translate(458px,156px);opacity:1} 74%,100%{transform:translate(458px,156px);opacity:0}}
+.pE{animation:pE 16s linear infinite}
+@keyframes pEd{0%,67%{opacity:1} 68%,100%{opacity:0}}
+.pEd{animation:pEd 16s linear infinite}
+@keyframes pEl{0%,67%{opacity:0} 68%,100%{opacity:1}}
+.pEl{animation:pEl 16s linear infinite}
+@keyframes ring{0%{transform:scale(1);opacity:0} 23%{transform:scale(1);opacity:0} 24%{transform:scale(1);opacity:1} 28%{transform:scale(1.9);opacity:0} 54%{transform:scale(1);opacity:0} 55%{transform:scale(1);opacity:1} 59%{transform:scale(1.9);opacity:0} 71%{transform:scale(1);opacity:0} 72%{transform:scale(1);opacity:1} 76%{transform:scale(1.9);opacity:0} 100%{transform:scale(1.9);opacity:0}}
+.ring{animation:ring 16s linear infinite}
+@keyframes r9{0%,27%{opacity:0} 28%{opacity:1} 100%{opacity:1}}
+.r9{animation:r9 16s linear infinite}
+@keyframes r10{0%,27.5%{opacity:0} 28.5%{opacity:1} 100%{opacity:1}}
+.r10{animation:r10 16s linear infinite}
+@keyframes r11{0%,28%{opacity:0} 29%{opacity:1} 100%{opacity:1}}
+.r11{animation:r11 16s linear infinite}
+@keyframes r12{0%,57%{opacity:0} 58%{opacity:1} 100%{opacity:1}}
+.r12{animation:r12 16s linear infinite}
+@keyframes r13{0%,74%{opacity:0} 75%{opacity:1} 100%{opacity:1}}
+.r13{animation:r13 16s linear infinite}
+@keyframes akA{0%,29%{opacity:0} 30%{opacity:1} 39%{opacity:1} 40%,100%{opacity:0}}
+.akA{animation:akA 16s linear infinite}
+@keyframes akB{0%,29%{opacity:0} 30%{opacity:1} 39%{opacity:1} 40%,100%{opacity:0}}
+.akB{animation:akB 16s linear infinite}
+@keyframes akC{0%,29%{opacity:0} 30%{opacity:1} 39%{opacity:1} 40%,100%{opacity:0}}
+.akC{animation:akC 16s linear infinite}
+@keyframes akD{0%,57%{opacity:0} 58%{opacity:1} 65%{opacity:1} 66%,100%{opacity:0}}
+.akD{animation:akD 16s linear infinite}
+@keyframes akE{0%,74%{opacity:0} 75%{opacity:1} 83%{opacity:1} 84%,100%{opacity:0}}
+.akE{animation:akE 16s linear infinite}
+@keyframes seg4{0%,60%{opacity:0} 61%{opacity:1} 100%{opacity:1}}
+.seg4{animation:seg4 16s linear infinite}
+@keyframes tag3a{0%,-0.99%{opacity:0} 0.01%{opacity:1} 60%{opacity:1} 61%,100%{opacity:0}}
+.tag3a{animation:tag3a 16s linear infinite}
+@keyframes tag3c{0%,60%{opacity:0} 61%{opacity:1} 100%{opacity:1}}
+.tag3c{animation:tag3c 16s linear infinite}
+@keyframes trc{0%,78%{opacity:0} 79%{opacity:1} 94%{opacity:1} 95%,100%{opacity:0}}
+.trc{animation:trc 16s linear infinite}
+@keyframes old{0%,82%{opacity:1} 86%,100%{opacity:.13}}
+.old{animation:old 16s linear infinite}
+@keyframes del{0%,85%{opacity:0} 86%{opacity:1} 100%{opacity:1}}
+.del{animation:del 16s linear infinite}
+@keyframes folc{0%,2%{transform:translate(566px,93px)} 4%{transform:translate(658px,93px)} 7%{transform:translate(750px,93px)} 10%{transform:translate(842px,93px)} 13%{transform:translate(566px,163px)} 16%{transform:translate(658px,163px)} 19%{transform:translate(750px,163px)} 22%,31%{transform:translate(842px,163px)} 33%{transform:translate(566px,233px)} 35%{transform:translate(658px,233px)} 37%,59%{transform:translate(750px,233px)} 61%,76%{transform:translate(842px,233px)} 78%,100%{transform:translate(566px,303px)}}
+.folc{animation:folc 16s linear infinite}
+@keyframes wait{0%,22%{opacity:0} 23%{opacity:1} 30%{opacity:1} 31%,100%{opacity:0}}
+.wait{animation:wait 16s linear infinite}
+@keyframes last8{0%,-0.99%{opacity:0} 0.01%{opacity:1} 28%{opacity:1} 29%,100%{opacity:0}}
+.last8{animation:last8 16s linear infinite}
+@keyframes last11{0%,28%{opacity:0} 29%{opacity:1} 57%{opacity:1} 58%,100%{opacity:0}}
+.last11{animation:last11 16s linear infinite}
+@keyframes last12{0%,57%{opacity:0} 58%{opacity:1} 74%{opacity:1} 75%,100%{opacity:0}}
+.last12{animation:last12 16s linear infinite}
+@keyframes last13{0%,74%{opacity:0} 75%{opacity:1} 100%{opacity:1}}
+.last13{animation:last13 16s linear infinite}
+@keyframes first1{0%,-0.99%{opacity:0} 0.01%{opacity:1} 85%{opacity:1} 86%,100%{opacity:0}}
+.first1{animation:first1 16s linear infinite}
+@keyframes first9{0%,85%{opacity:0} 86%{opacity:1} 100%{opacity:1}}
+.first9{animation:first9 16s linear infinite}
+@keyframes cap0{0%,-0.99%{opacity:0} 0.01%{opacity:1} 12%{opacity:1} 13%,100%{opacity:0}}
+.cap0{animation:cap0 16s linear infinite}
+@keyframes cap1{0%,12.5%{opacity:0} 13.5%{opacity:1} 19%{opacity:1} 20%,100%{opacity:0}}
+.cap1{animation:cap1 16s linear infinite}
+@keyframes cap2{0%,19.5%{opacity:0} 20.5%{opacity:1} 31%{opacity:1} 32%,100%{opacity:0}}
+.cap2{animation:cap2 16s linear infinite}
+@keyframes cap3{0%,31.5%{opacity:0} 32.5%{opacity:1} 39%{opacity:1} 40%,100%{opacity:0}}
+.cap3{animation:cap3 16s linear infinite}
+@keyframes cap4{0%,39.5%{opacity:0} 40.5%{opacity:1} 61%{opacity:1} 62%,100%{opacity:0}}
+.cap4{animation:cap4 16s linear infinite}
+@keyframes cap5{0%,61.5%{opacity:0} 62.5%{opacity:1} 77%{opacity:1} 78%,100%{opacity:0}}
+.cap5{animation:cap5 16s linear infinite}
+@keyframes cap6{0%,77.5%{opacity:0} 78.5%{opacity:1} 95%{opacity:1} 96%,100%{opacity:0}}
+.cap6{animation:cap6 16s linear infinite}</style>
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="var(--muted)"/></marker></defs>
+<rect width="960" height="470" fill="var(--bg)"/>
+<text x="24" y="38" style="font-size:20px;font-weight:700">go-wal<tspan class="muted" style="font-weight:400;font-size:15px">  ·  how an append becomes durable</tspan></text>
+<text x="24" y="72" class="s12 muted">callers (any goroutine)</text>
+<rect x="24" y="90" width="150" height="40" rx="7" class="panel"/>
+<text x="36" y="115" class="s12 mono">A: Append()</text>
+<path d="M174,110 L218,110" class="arrow"/>
+<rect x="24" y="150" width="150" height="40" rx="7" class="panel"/>
+<text x="36" y="175" class="s12 mono">B: Append()</text>
+<path d="M174,170 L218,170" class="arrow"/>
+<rect x="24" y="210" width="150" height="40" rx="7" class="panel"/>
+<text x="36" y="235" class="s12 mono">C: Append()</text>
+<path d="M174,230 L218,230" class="arrow"/>
+<rect x="220" y="80" width="200" height="180" rx="10" class="panel"/>
+<text x="320.0" y="104" text-anchor="middle" class="s13" style="font-weight:600">Singular Update Queue</text>
+<text x="320.0" y="122" text-anchor="middle" class="s11 muted">one writer goroutine</text>
+<rect x="229" y="150" width="54" height="28" rx="5" fill="none" stroke="var(--line)" stroke-dasharray="3 3"/>
+<rect x="293" y="150" width="54" height="28" rx="5" fill="none" stroke="var(--line)" stroke-dasharray="3 3"/>
+<rect x="357" y="150" width="54" height="28" rx="5" fill="none" stroke="var(--line)" stroke-dasharray="3 3"/>
+<text x="320.0" y="230" text-anchor="middle" class="s11 muted">batch · assign LSN · frame</text>
+<text x="320.0" y="246" text-anchor="middle" class="s11 muted mono">WithBatchSize / Timeout</text>
+<path d="M420,170 L455,170" class="arrow"/>
+<circle cx="485" cy="170" r="28" class="panel"/>
+<circle cx="485" cy="170" r="28" class="ring"/>
+<circle cx="485" cy="170" r="5" fill="var(--muted)"/>
+<text x="485" y="218" text-anchor="middle" class="s12 mono">fsync</text>
+<text x="485" y="233" text-anchor="middle" class="s11 muted">SyncBatched</text>
+<path d="M515,170 L556,220" class="arrow"/>
+<text x="560" y="72" class="s12 muted">data/wal/  ·  segments roll at MaxSegmentSize</text>
+<g class="scene">
+<g class="old">
+<text x="560" y="84" class="s11 mono">00000000000000000001.wal</text>
+<text x="940" y="84" text-anchor="end" class="s11 muted" style="">closed</text>
+<rect x="560" y="90" width="380" height="46" rx="7" class="panel"/>
+<text x="560" y="154" class="s11 mono">00000000000000000005.wal</text>
+<text x="940" y="154" text-anchor="end" class="s11 muted" style="">closed</text>
+<rect x="560" y="160" width="380" height="46" rx="7" class="panel"/>
+<g><rect x="570" y="97" width="82" height="32" rx="4" class="recr"/><text x="611.0" y="112" text-anchor="middle" class="s11 mono">LSN 1</text><rect x="576" y="118" width="9" height="5" class="b-crc"/><rect x="586" y="118" width="9" height="5" class="b-len"/><rect x="596" y="118" width="14" height="5" class="b-lsn"/><rect x="611" y="118" width="35" height="5" class="b-pay"/></g>
+<g><rect x="662" y="97" width="82" height="32" rx="4" class="recr"/><text x="703.0" y="112" text-anchor="middle" class="s11 mono">LSN 2</text><rect x="668" y="118" width="9" height="5" class="b-crc"/><rect x="678" y="118" width="9" height="5" class="b-len"/><rect x="688" y="118" width="14" height="5" class="b-lsn"/><rect x="703" y="118" width="35" height="5" class="b-pay"/></g>
+<g><rect x="754" y="97" width="82" height="32" rx="4" class="recr"/><text x="795.0" y="112" text-anchor="middle" class="s11 mono">LSN 3</text><rect x="760" y="118" width="9" height="5" class="b-crc"/><rect x="770" y="118" width="9" height="5" class="b-len"/><rect x="780" y="118" width="14" height="5" class="b-lsn"/><rect x="795" y="118" width="35" height="5" class="b-pay"/></g>
+<g><rect x="846" y="97" width="82" height="32" rx="4" class="recr"/><text x="887.0" y="112" text-anchor="middle" class="s11 mono">LSN 4</text><rect x="852" y="118" width="9" height="5" class="b-crc"/><rect x="862" y="118" width="9" height="5" class="b-len"/><rect x="872" y="118" width="14" height="5" class="b-lsn"/><rect x="887" y="118" width="35" height="5" class="b-pay"/></g>
+<g><rect x="570" y="167" width="82" height="32" rx="4" class="recr"/><text x="611.0" y="182" text-anchor="middle" class="s11 mono">LSN 5</text><rect x="576" y="188" width="9" height="5" class="b-crc"/><rect x="586" y="188" width="9" height="5" class="b-len"/><rect x="596" y="188" width="14" height="5" class="b-lsn"/><rect x="611" y="188" width="35" height="5" class="b-pay"/></g>
+<g><rect x="662" y="167" width="82" height="32" rx="4" class="recr"/><text x="703.0" y="182" text-anchor="middle" class="s11 mono">LSN 6</text><rect x="668" y="188" width="9" height="5" class="b-crc"/><rect x="678" y="188" width="9" height="5" class="b-len"/><rect x="688" y="188" width="14" height="5" class="b-lsn"/><rect x="703" y="188" width="35" height="5" class="b-pay"/></g>
+<g><rect x="754" y="167" width="82" height="32" rx="4" class="recr"/><text x="795.0" y="182" text-anchor="middle" class="s11 mono">LSN 7</text><rect x="760" y="188" width="9" height="5" class="b-crc"/><rect x="770" y="188" width="9" height="5" class="b-len"/><rect x="780" y="188" width="14" height="5" class="b-lsn"/><rect x="795" y="188" width="35" height="5" class="b-pay"/></g>
+<g><rect x="846" y="167" width="82" height="32" rx="4" class="recr"/><text x="887.0" y="182" text-anchor="middle" class="s11 mono">LSN 8</text><rect x="852" y="188" width="9" height="5" class="b-crc"/><rect x="862" y="188" width="9" height="5" class="b-len"/><rect x="872" y="188" width="14" height="5" class="b-lsn"/><rect x="887" y="188" width="35" height="5" class="b-pay"/></g>
+</g>
+<g class="del"><text x="750.0" y="157" text-anchor="middle" class="s13 danger">LSN 1–8 deleted · FirstLSN → 9</text></g>
+<text x="560" y="224" class="s11 mono">00000000000000000009.wal</text>
+<text x="940" y="224" text-anchor="end" class="s11 ok tag3a" style="fill:var(--ok)">active</text>
+<text x="940" y="224" text-anchor="end" class="s11 muted tag3c" style="">closed</text>
+<rect x="560" y="230" width="380" height="46" rx="7" class="panel"/>
+<g class="r9"><rect x="570" y="237" width="82" height="32" rx="4" class="recr"/><text x="611.0" y="252" text-anchor="middle" class="s11 mono">LSN 9</text><rect x="576" y="258" width="9" height="5" class="b-crc"/><rect x="586" y="258" width="9" height="5" class="b-len"/><rect x="596" y="258" width="14" height="5" class="b-lsn"/><rect x="611" y="258" width="35" height="5" class="b-pay"/></g>
+<g class="r10"><rect x="662" y="237" width="82" height="32" rx="4" class="recr"/><text x="703.0" y="252" text-anchor="middle" class="s11 mono">LSN 10</text><rect x="668" y="258" width="9" height="5" class="b-crc"/><rect x="678" y="258" width="9" height="5" class="b-len"/><rect x="688" y="258" width="14" height="5" class="b-lsn"/><rect x="703" y="258" width="35" height="5" class="b-pay"/></g>
+<g class="r11"><rect x="754" y="237" width="82" height="32" rx="4" class="recr"/><text x="795.0" y="252" text-anchor="middle" class="s11 mono">LSN 11</text><rect x="760" y="258" width="9" height="5" class="b-crc"/><rect x="770" y="258" width="9" height="5" class="b-len"/><rect x="780" y="258" width="14" height="5" class="b-lsn"/><rect x="795" y="258" width="35" height="5" class="b-pay"/></g>
+<g class="r12"><rect x="846" y="237" width="82" height="32" rx="4" class="recr"/><text x="887.0" y="252" text-anchor="middle" class="s11 mono">LSN 12</text><rect x="852" y="258" width="9" height="5" class="b-crc"/><rect x="862" y="258" width="9" height="5" class="b-len"/><rect x="872" y="258" width="14" height="5" class="b-lsn"/><rect x="887" y="258" width="35" height="5" class="b-pay"/></g>
+<g class="seg4">
+<text x="560" y="294" class="s11 mono">00000000000000000013.wal</text>
+<text x="940" y="294" text-anchor="end" class="s11 tag4" style="fill:var(--ok)">active</text>
+<rect x="560" y="300" width="380" height="46" rx="7" class="panel"/>
+</g>
+<g class="r13"><rect x="570" y="307" width="82" height="32" rx="4" class="recr"/><text x="611.0" y="322" text-anchor="middle" class="s11 mono">LSN 13</text><rect x="576" y="328" width="9" height="5" class="b-crc"/><rect x="586" y="328" width="9" height="5" class="b-len"/><rect x="596" y="328" width="14" height="5" class="b-lsn"/><rect x="611" y="328" width="35" height="5" class="b-pay"/></g>
+<g class="folc"><rect x="0" y="0" width="90" height="40" rx="6" class="fol"/></g>
+<g class="wait"><text x="940" y="384" text-anchor="end" class="s11" style="fill:var(--fol)">follower waits at tail…</text></g>
+<g class="akA"><text x="180" y="103" class="s11 ack mono">✓ 9</text></g>
+<g class="akB"><text x="180" y="163" class="s11 ack mono">✓ 10</text></g>
+<g class="akC"><text x="180" y="223" class="s11 ack mono">✓ 11</text></g>
+<g class="akD"><text x="180" y="103" class="s11 ack mono">✓ 12</text></g>
+<g class="akE"><text x="180" y="223" class="s11 ack mono">✓ 13</text></g>
+<g class="pA"><rect width="54" height="28" rx="5" class="pkr"/><text x="27.0" y="18" text-anchor="middle" class="s11 mono pAd">data</text><text x="27.0" y="18" text-anchor="middle" class="s11 mono pAl" style="font-weight:600">LSN 9</text></g>
+<g class="pB"><rect width="54" height="28" rx="5" class="pkr"/><text x="27.0" y="18" text-anchor="middle" class="s11 mono pBd">data</text><text x="27.0" y="18" text-anchor="middle" class="s11 mono pBl" style="font-weight:600">LSN 10</text></g>
+<g class="pC"><rect width="54" height="28" rx="5" class="pkr"/><text x="27.0" y="18" text-anchor="middle" class="s11 mono pCd">data</text><text x="27.0" y="18" text-anchor="middle" class="s11 mono pCl" style="font-weight:600">LSN 11</text></g>
+<g class="pD"><rect width="54" height="28" rx="5" class="pkr"/><text x="27.0" y="18" text-anchor="middle" class="s11 mono pDd">data</text><text x="27.0" y="18" text-anchor="middle" class="s11 mono pDl" style="font-weight:600">LSN 12</text></g>
+<g class="pE"><rect width="54" height="28" rx="5" class="pkr"/><text x="27.0" y="18" text-anchor="middle" class="s11 mono pEd">data</text><text x="27.0" y="18" text-anchor="middle" class="s11 mono pEl" style="font-weight:600">LSN 13</text></g>
+<g class="trc"><rect x="24" y="282" width="150" height="40" rx="7" class="panel" style="stroke:var(--danger)"/><text x="36" y="307" class="s12 mono danger">w.Truncate(9)</text></g>
+<text x="560" y="384" class="s12 mono muted">FirstLSN</text>
+<text x="720" y="384" class="s12 mono muted">LastLSN</text>
+<text x="628" y="384" class="s12 mono first1" style="font-weight:700">1</text>
+<text x="628" y="384" class="s12 mono first9" style="font-weight:700">9</text>
+<text x="782" y="384" class="s12 mono last8" style="font-weight:700">8</text>
+<text x="782" y="384" class="s12 mono last11" style="font-weight:700">11</text>
+<text x="782" y="384" class="s12 mono last12" style="font-weight:700">12</text>
+<text x="782" y="384" class="s12 mono last13" style="font-weight:700">13</text>
+<text x="24" y="384" class="s13 cap0" style="font-weight:600">1 · Concurrent Append() calls are queued for one writer goroutine</text>
+<text x="24" y="384" class="s13 cap1" style="font-weight:600">2 · The writer batches them and assigns monotonic, gapless LSNs</text>
+<text x="24" y="384" class="s13 cap2" style="font-weight:600">3 · Each batch is written, fsync'd once (group commit), then acked</text>
+<text x="24" y="384" class="s13 cap3" style="font-weight:600">4 · The follower was blocked at the tail. It wakes and reads 9–11</text>
+<text x="24" y="384" class="s13 cap4" style="font-weight:600">5 · LSN 12 fills the segment, so the log rolls to a new file</text>
+<text x="24" y="384" class="s13 cap5" style="font-weight:600">6 · Appends continue in the new active segment, with no LSN gap</text>
+<text x="24" y="384" class="s13 cap6" style="font-weight:600">7 · Truncate(9) deletes the whole closed segments below LSN 9</text>
+</g>
+<line x1="24" y1="408" x2="936" y2="408" stroke="var(--line)"/>
+<text x="24" y="430" class="s11 muted">record frame:</text>
+<rect x="112" y="421" width="12" height="9" class="b-crc"/>
+<text x="129" y="430" class="s11 mono">CRC32C</text>
+<rect x="189" y="421" width="12" height="9" class="b-len"/>
+<text x="206" y="430" class="s11 mono">Length</text>
+<rect x="266" y="421" width="12" height="9" class="b-lsn"/>
+<text x="283" y="430" class="s11 mono">LSN</text>
+<rect x="322" y="421" width="12" height="9" class="b-pay"/>
+<text x="339" y="430" class="s11 mono">Payload</text>
+<rect x="416" y="419" width="22" height="13" rx="3" class="fol"/>
+<text x="446" y="430" class="s11">Follower cursor (WithFollow)</text>
+<text x="936" y="452" text-anchor="end" class="s11 muted">segment header: Magic · Version · Flags · BaseLSN · CreatedAt · CRC</text>
+<text x="24" y="452" class="s11 muted">On Open, recovery truncates a torn tail, resumes at LastLSN+1.</text>
+</svg>
