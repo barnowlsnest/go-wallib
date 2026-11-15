@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"github.com/barnowlsnest/go-wallib/internal/record"
 	"github.com/barnowlsnest/go-wallib/internal/segment"
@@ -18,13 +19,27 @@ type Reader struct {
 	file         *os.File
 	scanner      *record.Scanner
 	err          error
+	position     readerPosition
 	segmentNames []string
 	current      Entry
 	index        int
 	fromLSN      uint64
 	endLSN       uint64
 	maxRecord    int
-	done         bool
+	// startOffset, when set, is where the first segment opened is read from
+	// instead of just past its header; see resumeAt.
+	startOffset int64
+	// scanBase is the file offset the current scanner started reading from.
+	scanBase int64
+	done     bool
+}
+
+// readerPosition names a segment and the byte offset just past the last record
+// a Reader consumed in it, so a later Reader can continue from there instead of
+// scanning the segment again from its start.
+type readerPosition struct {
+	segmentName string
+	offset      int64
 }
 
 // readerSnapshot captures the segment file names, the last committed LSN, and the
@@ -47,6 +62,7 @@ func newReaderFrom(dir string, segmentNames []string, fromLSN, endLSN uint64, ma
 	return &Reader{
 		dir:          dir,
 		segmentNames: segmentNames,
+		index:        startIndex(segmentNames, fromLSN),
 		fromLSN:      fromLSN,
 		endLSN:       endLSN,
 		maxRecord:    maxRecord,
@@ -76,7 +92,12 @@ func (r *Reader) Next() bool {
 		}
 
 		if r.scanner.Next() {
-			if entry, ok := r.accept(r.scanner.Record()); ok {
+			scanned := r.scanner.Record()
+			if scanned.LSN <= r.endLSN {
+				r.position.offset = r.scanBase + r.scanner.Offset()
+			}
+
+			if entry, ok := r.accept(scanned); ok {
 				r.current = entry
 
 				return true
@@ -142,7 +163,12 @@ func (r *Reader) openNext() bool {
 			return false
 		}
 
-		if _, err := file.Seek(segment.HeaderSize, io.SeekStart); err != nil {
+		offset := int64(segment.HeaderSize)
+		if r.startOffset > 0 {
+			offset, r.startOffset = r.startOffset, 0
+		}
+
+		if _, err := file.Seek(offset, io.SeekStart); err != nil {
 			_ = file.Close()
 			r.fail(err)
 
@@ -151,6 +177,8 @@ func (r *Reader) openNext() bool {
 
 		r.file = file
 		r.scanner = record.NewScanner(bufio.NewReader(file), r.maxRecord)
+		r.scanBase = offset
+		r.position = readerPosition{segmentName: name, offset: offset}
 
 		return true
 	}
@@ -180,10 +208,47 @@ func (r *Reader) relistAfter(missing string) error {
 	}
 
 	r.segmentNames = remaining
-	r.index = 0
+	r.index = startIndex(remaining, r.fromLSN)
+	r.startOffset = 0
 
 	return nil
 }
+
+// startIndex returns the index of the last segment whose base LSN is <= fromLSN,
+// or 0 when there is none. Segment names are sorted by base LSN and a segment
+// holds no LSN at or above the next segment's base (a cut's overlap copy lives in
+// that next segment too), so every segment before this index can be skipped
+// without reading it.
+func startIndex(segmentNames []string, fromLSN uint64) int {
+	above := sort.Search(len(segmentNames), func(i int) bool {
+		base, _ := segment.ParseBaseLSN(segmentNames[i])
+
+		return base > fromLSN
+	})
+
+	return max(above-1, 0)
+}
+
+// resumeAt continues from a position an earlier Reader left, when that segment
+// is the one this Reader would start in anyway. A segment file is only ever
+// appended to under its name (a cut writes its records into a new seg-<cut> and
+// deletes the old name), so the offset still lands on a record boundary. In every
+// other case, including a segment the snapshot no longer names, the start chosen
+// from fromLSN is kept.
+func (r *Reader) resumeAt(position readerPosition) {
+	if r.done || position.segmentName == "" || r.index >= len(r.segmentNames) {
+		return
+	}
+
+	if r.segmentNames[r.index] == position.segmentName {
+		r.startOffset = position.offset
+	}
+}
+
+// lastPosition reports where this Reader stopped: the segment it last read and
+// the offset just past the last record it consumed within its snapshot. It is
+// empty if the Reader never opened a segment.
+func (r *Reader) lastPosition() readerPosition { return r.position }
 
 // closeCurrent closes the open segment so the next one can be read.
 func (r *Reader) closeCurrent() {

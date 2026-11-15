@@ -27,10 +27,13 @@ func WithFollow() FollowerOption {
 // Follower is NOT safe for concurrent use; use one per consumer goroutine, and
 // call either Records or RecordsChan once.
 type Follower struct {
-	wal        *WAL
-	cancel     context.CancelFunc
-	done       chan struct{}
-	err        error
+	wal    *WAL
+	cancel context.CancelFunc
+	done   chan struct{}
+	err    error
+	// resume is where the previous scan stopped, so each wake in follow mode
+	// reads only the records committed since instead of the segment again.
+	resume     readerPosition
 	maxRecord  int
 	endLSN     uint64
 	fromLSN    uint64
@@ -86,6 +89,13 @@ func (f *Follower) scanBatch(
 ) (result scanResult) {
 	expectedLSN := *highWater + 1
 	reader := newReaderFrom(f.wal.dir, segmentNames, expectedLSN, endLSN, f.maxRecord)
+	reader.resumeAt(f.resume)
+
+	defer func() {
+		if position := reader.lastPosition(); position.segmentName != "" {
+			f.resume = position
+		}
+	}()
 
 	for reader.Next() {
 		entry := reader.Entry()
