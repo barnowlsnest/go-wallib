@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
 
+	"github.com/barnowlsnest/go-wallib/internal/record"
 	"github.com/barnowlsnest/go-wallib/internal/segment"
 )
 
@@ -214,5 +216,79 @@ func (s *ReaderSuite) TestReaderSkipsOverlapLeftByInProgressCut() {
 
 	for i, entry := range entries {
 		s.Assert().Equal(uint64(i+1), entry.LSN)
+	}
+}
+
+// segmentBases returns a copy of the WAL's segment base LSNs, oldest first.
+func (w *WAL) segmentBases() []uint64 {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	return slices.Clone(w.segmentBaseLSNs)
+}
+
+// corruptFirstPayloadByte flips the first payload byte of the first record in
+// the segment based at baseLSN, so any read of that record fails its CRC.
+func corruptFirstPayloadByte(t *testing.T, dir string, baseLSN uint64) {
+	t.Helper()
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+
+	file, err := root.OpenFile(segment.Name(baseLSN), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = file.Close() }()
+
+	offset := int64(segment.HeaderSize + record.HeaderSize)
+	current := make([]byte, 1)
+	if _, err := file.ReadAt(current, offset); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt([]byte{current[0] ^ 0xFF}, offset); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A reader opens the segment that holds fromLSN and never reads the segments
+// before it, so a corrupt earlier segment cannot fail a read that starts later.
+func (s *ReaderSuite) TestReaderStartsInSegmentHoldingFromLSN() {
+	cases := []struct {
+		fromLSN func(bases []uint64, lastLSN uint64) uint64
+		name    string
+	}{
+		{name: "first record of a later segment", fromLSN: func(bases []uint64, _ uint64) uint64 { return bases[2] }},
+		{name: "inside a later segment", fromLSN: func(bases []uint64, _ uint64) uint64 { return bases[2] + 1 }},
+		{name: "last record", fromLSN: func(_ []uint64, lastLSN uint64) uint64 { return lastLSN }},
+	}
+
+	for _, tc := range cases {
+		s.Run(tc.name, func() {
+			s.dir = s.T().TempDir()
+			w := s.appendSequential(20, WithMaxSegmentSize(256))
+			defer func() { s.Require().NoError(w.Close()) }()
+
+			bases := w.segmentBases()
+			s.Require().GreaterOrEqual(len(bases), 4)
+			s.Require().Greater(bases[3], bases[2]+1, "segment 2 must hold at least two records")
+			corruptFirstPayloadByte(s.T(), s.dir, bases[0])
+
+			fromLSN := tc.fromLSN(bases, w.LastLSN())
+			reader, err := w.NewReader(fromLSN)
+			s.Require().NoError(err)
+			defer func() { s.Require().NoError(reader.Close()) }()
+
+			actual := s.collect(reader)
+			s.Require().Len(actual, int(w.LastLSN()-fromLSN+1))
+			for i, entry := range actual {
+				expected := fromLSN + uint64(i)
+				s.Assert().Equal(expected, entry.LSN)
+				s.Assert().Equal(payloadForLSN(expected), entry.Payload)
+			}
+		})
 	}
 }

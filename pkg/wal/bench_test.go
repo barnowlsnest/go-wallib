@@ -115,3 +115,104 @@ func BenchmarkReplay(b *testing.B) {
 		}
 	}
 }
+
+// benchLayouts spreads the same ~8 MiB of 1 KiB records over one segment or
+// over 64 segments, so a benchmark shows both the cost that grows with the whole
+// log and the cost that stays inside one segment.
+var benchLayouts = []struct {
+	name        string
+	segmentSize int64
+}{
+	{"OneSegment", 16 << 20},
+	{"64Segments", 128 << 10},
+}
+
+const (
+	benchFillRecords = 8 << 10
+	benchFillBatch   = 256
+	benchRecordSize  = 1 << 10
+)
+
+// openFilledWAL opens a WAL in a fresh directory and appends benchFillRecords
+// records, so reads near the tail have a large log behind them.
+func openFilledWAL(b *testing.B, segmentSize int64) *WAL {
+	b.Helper()
+
+	w, _, err := Open(b.TempDir(), WithSyncPolicy(SyncInterval), WithMaxSegmentSize(segmentSize))
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	payload := makeBenchPayload(benchRecordSize)
+	batch := make([][]byte, benchFillBatch)
+	for i := range batch {
+		batch[i] = payload
+	}
+
+	for range benchFillRecords / benchFillBatch {
+		if _, appendErr := w.AppendBatch(context.Background(), batch); appendErr != nil {
+			b.Fatal(appendErr)
+		}
+	}
+
+	return w
+}
+
+// BenchmarkNewReaderNearTail measures opening a reader at the last record and
+// reading it, which is what a cache miss on a recent record costs.
+func BenchmarkNewReaderNearTail(b *testing.B) {
+	for _, layout := range benchLayouts {
+		b.Run(layout.name, func(b *testing.B) {
+			w := openFilledWAL(b, layout.segmentSize)
+			defer func() { _ = w.Close() }()
+
+			lastLSN := w.LastLSN()
+
+			b.ReportAllocs()
+			for b.Loop() {
+				reader, err := w.NewReader(lastLSN)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if !reader.Next() || reader.Entry().LSN != lastLSN {
+					b.Fatalf("expected LSN %d, err %v", lastLSN, reader.Err())
+				}
+				_ = reader.Close()
+			}
+		})
+	}
+}
+
+// BenchmarkFollowerTail measures one append reaching a follow-mode follower
+// parked at the tail of a large log: the per-record cost of live tailing.
+func BenchmarkFollowerTail(b *testing.B) {
+	for _, layout := range benchLayouts {
+		b.Run(layout.name, func(b *testing.B) {
+			w := openFilledWAL(b, layout.segmentSize)
+			defer func() { _ = w.Close() }()
+
+			follower, err := w.Follower(w.LastLSN()+1, WithFollow())
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer func() { _ = follower.Close() }()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			entries := follower.RecordsChan(ctx)
+			payload := makeBenchPayload(benchRecordSize)
+
+			b.ReportAllocs()
+			for b.Loop() {
+				lsn, appendErr := w.Append(ctx, payload)
+				if appendErr != nil {
+					b.Fatal(appendErr)
+				}
+				if entry := <-entries; entry.LSN != lsn {
+					b.Fatalf("expected LSN %d, got %d (err %v)", lsn, entry.LSN, follower.Err())
+				}
+			}
+		})
+	}
+}

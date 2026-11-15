@@ -413,3 +413,86 @@ func (s *FollowerSuite) TestFollowTruncatedPosition() {
 	stop()
 	s.Assert().ErrorIs(follower.Err(), ErrTruncated)
 }
+
+// receive reads count entries from a follower channel, failing the test if the
+// follower stops or stalls first.
+func (s *FollowerSuite) receive(entries <-chan Entry, count int) []uint64 {
+	s.T().Helper()
+
+	got := make([]uint64, 0, count)
+	for len(got) < count {
+		select {
+		case entry, ok := <-entries:
+			if !ok {
+				s.FailNow("follower stopped", "got %v", got)
+			}
+			got = append(got, entry.LSN)
+		case <-time.After(2 * time.Second):
+			s.FailNow("follower stalled", "got %v", got)
+		}
+	}
+
+	return got
+}
+
+// lsnRange returns the LSNs first..last in order.
+func lsnRange(first, last uint64) []uint64 {
+	lsns := make([]uint64, 0, last-first+1)
+	for lsn := first; lsn <= last; lsn++ {
+		lsns = append(lsns, lsn)
+	}
+
+	return lsns
+}
+
+// A follow-mode follower parked at the tail continues from where it stopped
+// instead of re-reading the log: a record it already delivered is never read
+// again (so corrupting it does not matter), and it keeps going when its segment
+// rolls or is rewritten by a cut while it waits.
+func (s *FollowerSuite) TestFollowResumesWhereItStopped() {
+	cases := []struct {
+		change func(w *WAL)
+		name   string
+		opts   []Option
+	}{
+		{
+			name:   "already-delivered record corrupted",
+			change: func(*WAL) { corruptFirstPayloadByte(s.T(), s.dir, 1) },
+		},
+		{
+			name:   "segment rolls",
+			opts:   []Option{WithMaxSegmentSize(256)},
+			change: func(*WAL) {},
+		},
+		{
+			name:   "segment rewritten by a cut",
+			change: func(w *WAL) { s.Require().NoError(w.CutOffset(5)) },
+		},
+	}
+
+	for _, tc := range cases {
+		s.Run(tc.name, func() {
+			s.dir = s.T().TempDir()
+			w := s.appendSequential(10, tc.opts...)
+			defer func() { _ = w.Close() }()
+
+			follower, err := w.Follower(1, WithFollow())
+			s.Require().NoError(err)
+			defer func() { _ = follower.Close() }()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			entries := follower.RecordsChan(ctx)
+
+			s.Require().Equal(lsnRange(1, 10), s.receive(entries, 10))
+
+			tc.change(w)
+			for lsn := uint64(11); lsn <= 15; lsn++ {
+				_, appendErr := w.Append(context.Background(), payloadForLSN(lsn))
+				s.Require().NoError(appendErr)
+			}
+
+			s.Assert().Equal(lsnRange(11, 15), s.receive(entries, 5))
+		})
+	}
+}
