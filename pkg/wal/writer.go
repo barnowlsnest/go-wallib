@@ -529,6 +529,7 @@ func (w *WAL) doTruncate(upTo uint64) error {
 		delete(w.indexes, baseLSN)
 	}
 	w.segmentBaseLSNs = w.segmentBaseLSNs[deletable:]
+	w.removals.Add(1)
 	newFirstLSN := w.segmentBaseLSNs[0]
 	w.firstLSN = newFirstLSN
 	w.mu.Unlock()
@@ -661,6 +662,7 @@ func (w *WAL) cutDeleteBelow(baseLSNs []uint64, boundary int, cut uint64) error 
 		delete(w.indexes, baseLSN)
 	}
 	w.segmentBaseLSNs = w.segmentBaseLSNs[boundary:]
+	w.removals.Add(1)
 	w.firstLSN = cut
 	w.mu.Unlock()
 
@@ -709,6 +711,7 @@ func (w *WAL) cutRewriteBoundary(baseLSNs []uint64, boundary int, cut uint64) er
 		w.indexes[cut] = slices.Clone(index)
 	}
 	w.segmentBaseLSNs = append([]uint64{cut}, w.segmentBaseLSNs[boundary+1:]...)
+	w.removals.Add(1)
 	w.firstLSN = cut
 	if isActive {
 		w.active = replacement
@@ -761,6 +764,7 @@ func (w *WAL) cutEverything(baseLSNs []uint64, nextLSN uint64) error {
 	w.active = replacement
 	w.segmentBaseLSNs = []uint64{nextLSN}
 	w.indexes = make(map[uint64][]segment.IndexEntry)
+	w.removals.Add(1)
 	w.firstLSN = 0
 	w.mu.Unlock()
 

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/barnowlsnest/go-wallib/internal/segment"
 )
@@ -21,33 +22,29 @@ type openedSeg struct {
 // WAL is a Write-Ahead Log. It is safe for concurrent use.
 type WAL struct {
 	closeErr        error
-	active          *segment.Segment
-	closed          chan struct{}
+	cutCh           chan *writerOpRequest
+	root            *os.Root
 	requestCh       chan *appendRequest
 	controlCh       chan chan error
 	truncateCh      chan *writerOpRequest
-	cutCh           chan *writerOpRequest
+	active          *segment.Segment
 	subscribeCh     chan wakeup
-	root            *os.Root
+	closed          chan struct{}
+	indexes         map[uint64][]segment.IndexEntry
 	dir             string
 	segmentBaseLSNs []uint64
-	// indexes maps a segment's base LSN to its published index entries, so a
-	// reader can start near its LSN instead of at the segment start. Guarded by
-	// mu; only the writer goroutine changes it.
-	indexes        map[uint64][]segment.IndexEntry
-	pendingWaiters []chan struct{}
-	opts           options
-	wg             sync.WaitGroup
-	nextLSN        uint64
-	// stagedFromLSN is the LSN of the first record in the active segment's write
-	// buffer, i.e. nextLSN as of the last flush. Only the writer goroutine uses it.
-	stagedFromLSN uint64
-	firstLSN      uint64
-	lastLSN       uint64
-	closeMu       sync.RWMutex
-	mu            sync.RWMutex
-	closeOnce     sync.Once
-	isClosed      bool
+	pendingWaiters  []chan struct{}
+	opts            options
+	wg              sync.WaitGroup
+	removals        atomic.Uint64
+	nextLSN         uint64
+	stagedFromLSN   uint64
+	firstLSN        uint64
+	lastLSN         uint64
+	closeMu         sync.RWMutex
+	mu              sync.RWMutex
+	closeOnce       sync.Once
+	isClosed        bool
 }
 
 // Open recovers an existing log in dir or creates a new one. It returns a

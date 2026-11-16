@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"iter"
+	"os"
 	"sync"
 )
 
@@ -27,20 +28,21 @@ func WithFollow() FollowerOption {
 // Follower is NOT safe for concurrent use; use one per consumer goroutine, and
 // call either Records or RecordsChan once.
 type Follower struct {
-	wal    *WAL
-	cancel context.CancelFunc
-	done   chan struct{}
-	err    error
-	// resume is where the previous scan stopped, so each wake in follow mode
-	// reads only the records committed since instead of the segment again.
-	resume     readerPosition
-	maxRecord  int
-	endLSN     uint64
-	fromLSN    uint64
-	mu         sync.Mutex
-	closeOnce  sync.Once
-	follow     bool
-	userClosed bool
+	err          error
+	held         *os.File
+	cancel       context.CancelFunc
+	done         chan struct{}
+	wal          *WAL
+	heldName     string
+	resume       readerPosition
+	heldRemovals uint64
+	maxRecord    int
+	endLSN       uint64
+	fromLSN      uint64
+	closeOnce    sync.Once
+	mu           sync.Mutex
+	follow       bool
+	userClosed   bool
 }
 
 // Follower creates a Follower yielding committed records with LSN >= fromLSN
@@ -97,10 +99,23 @@ func (f *Follower) scanBatch(
 	}
 	reader.resumeAt(start)
 
+	// Read before the reader opens anything: a segment deleted after this
+	// point bumps removals, so the file is not reused on the next wake.
+	removals := f.wal.removals.Load()
+	if f.held != nil && f.heldRemovals == removals {
+		reader.offer(f.held, f.heldName)
+		f.held = nil
+	}
+	f.releaseHeld()
+	reader.retain = true
+
 	defer func() {
 		if position := reader.lastPosition(); position.segmentName != "" {
 			f.resume = position
 		}
+
+		f.held, f.heldName = reader.takeRetained()
+		f.heldRemovals = removals
 	}()
 
 	for reader.Next() {
@@ -149,6 +164,7 @@ func (f *Follower) Records(ctx context.Context) iter.Seq2[uint64, []byte] {
 
 	return func(yield func(uint64, []byte) bool) {
 		defer cancel()
+		defer f.releaseHeld()
 
 		if alreadyClosed {
 			return
@@ -194,6 +210,15 @@ func (f *Follower) Records(ctx context.Context) iter.Seq2[uint64, []byte] {
 			}
 		}
 	}
+}
+
+// releaseHeld closes the segment file kept from the previous scan, if any.
+func (f *Follower) releaseHeld() {
+	if f.held != nil {
+		_ = f.held.Close()
+	}
+
+	f.held, f.heldName = nil, ""
 }
 
 // waitForCommit blocks until the next commit, returning false (and setting err

@@ -425,3 +425,66 @@ func (s *ReaderSuite) requireIndexesMatchSegments(w *WAL) {
 		s.Require().Contains(w.segmentBaseLSNs, baseLSN, "index kept for removed segment %d", baseLSN)
 	}
 }
+
+// A reader asked to retain its file hands back the open file of the segment it
+// ended in, and a later reader offered that file reads through it instead of
+// opening the segment again.
+func (s *ReaderSuite) TestReaderHandsBackAndReusesSegmentFile() {
+	w := s.appendSequential(5)
+	defer func() { s.Require().NoError(w.Close()) }()
+
+	segmentNames, endLSN, _ := w.readerSnapshot()
+	first := newReaderFrom(w.dir, segmentNames, 1, endLSN, w.opts.maxRecordSize)
+	first.retain = true
+	s.Require().Len(s.collect(first), 5)
+	s.Require().NoError(first.Close())
+
+	held, heldName := first.takeRetained()
+	s.Require().NotNil(held)
+	s.Require().Equal(segmentNames[len(segmentNames)-1], heldName)
+
+	for lsn := uint64(6); lsn <= 8; lsn++ {
+		_, err := w.Append(context.Background(), payloadForLSN(lsn))
+		s.Require().NoError(err)
+	}
+
+	segmentNames, endLSN, _ = w.readerSnapshot()
+	second := newReaderFrom(w.dir, segmentNames, 6, endLSN, w.opts.maxRecordSize)
+	second.resumeAt(first.lastPosition())
+	second.retain = true
+	second.offer(held, heldName)
+
+	var actual []uint64
+	for second.Next() {
+		s.Require().Same(held, second.file, "reader opened the segment again")
+		actual = append(actual, second.Entry().LSN)
+	}
+	s.Require().NoError(second.Err())
+	s.Require().Equal([]uint64{6, 7, 8}, actual)
+	s.Require().NoError(second.Close())
+
+	retained, _ := second.takeRetained()
+	s.Require().Same(held, retained)
+	s.Require().NoError(retained.Close())
+}
+
+// A file offered for a segment the reader never reads is closed with the
+// reader, and a reader that was not asked to retain closes its own file.
+func (s *ReaderSuite) TestReaderClosesFilesItDoesNotHandBack() {
+	w := s.appendSequential(5)
+	defer func() { s.Require().NoError(w.Close()) }()
+
+	offered, err := os.OpenInRoot(w.dir, segment.Name(1))
+	s.Require().NoError(err)
+
+	segmentNames, endLSN, _ := w.readerSnapshot()
+	reader := newReaderFrom(w.dir, segmentNames, 1, endLSN, w.opts.maxRecordSize)
+	reader.offer(offered, "not-a-segment-in-the-snapshot.wal")
+
+	s.Require().Len(s.collect(reader), 5)
+	s.Require().NoError(reader.Close())
+
+	retained, _ := reader.takeRetained()
+	s.Require().Nil(retained)
+	s.Require().ErrorIs(offered.Close(), os.ErrClosed)
+}

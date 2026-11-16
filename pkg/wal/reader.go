@@ -15,23 +15,25 @@ import (
 // Reader is a forward cursor over committed log entries. It is not safe for
 // concurrent use by multiple goroutines.
 type Reader struct {
-	dir          string
+	err          error
+	offered      *os.File
 	file         *os.File
 	scanner      *record.Scanner
-	err          error
+	retained     *os.File
+	retainedName string
+	dir          string
+	offeredName  string
 	position     readerPosition
 	segmentNames []string
 	current      Entry
-	index        int
 	fromLSN      uint64
-	endLSN       uint64
+	scanBase     int64
+	startOffset  int64
 	maxRecord    int
-	// startOffset, when set, is where the first segment opened is read from
-	// instead of just past its header; see resumeAt.
-	startOffset int64
-	// scanBase is the file offset the current scanner started reading from.
-	scanBase int64
-	done     bool
+	endLSN       uint64
+	index        int
+	retain       bool
+	done         bool
 }
 
 // readerPosition names a segment and the byte offset just past the last record
@@ -149,6 +151,12 @@ func (r *Reader) Next() bool {
 			return false
 		}
 
+		if r.index >= len(r.segmentNames) {
+			r.end()
+
+			return false
+		}
+
 		r.closeCurrent()
 	}
 
@@ -164,7 +172,7 @@ func (r *Reader) accept(scanned record.Record) (Entry, bool) {
 	case scanned.LSN < r.fromLSN:
 		return Entry{}, false
 	case scanned.LSN > r.endLSN:
-		r.finish()
+		r.end()
 
 		return Entry{}, false
 	default:
@@ -183,7 +191,7 @@ func (r *Reader) openNext() bool {
 		name := r.segmentNames[r.index]
 		r.index++
 
-		file, err := os.OpenInRoot(r.dir, name)
+		file, err := r.openSegment(name)
 		if err != nil {
 			if os.IsNotExist(err) {
 				if err := r.relistAfter(name); err != nil {
@@ -223,6 +231,49 @@ func (r *Reader) openNext() bool {
 	r.finish()
 
 	return false
+}
+
+// openSegment returns the offered file when it is for name, and otherwise
+// opens the segment.
+func (r *Reader) openSegment(name string) (*os.File, error) {
+	if r.offered != nil && name == r.offeredName {
+		file := r.offered
+		r.offered = nil
+
+		return file, nil
+	}
+
+	return os.OpenInRoot(r.dir, name)
+}
+
+// offer gives the reader an open file of segment name to read through instead
+// of opening that segment again. The reader seeks it to where it starts, so the
+// file's current offset does not matter. The reader owns the file from here on:
+// it closes it like any file it opened, or on Close if it never reads that
+// segment.
+func (r *Reader) offer(file *os.File, name string) {
+	r.offered, r.offeredName = file, name
+}
+
+// takeRetained returns the open file of the segment a retaining reader ended
+// in, and its name, passing ownership to the caller. It is nil when the reader
+// was not asked to retain or stopped on an error or before its end.
+func (r *Reader) takeRetained() (file *os.File, name string) {
+	file, name = r.retained, r.retainedName
+	r.retained, r.retainedName = nil, ""
+
+	return file, name
+}
+
+// end stops the cursor at the end of its snapshot. A retaining reader keeps
+// the current segment's file for takeRetained instead of closing it.
+func (r *Reader) end() {
+	if r.retain && r.file != nil {
+		r.retained, r.retainedName = r.file, r.position.segmentName
+		r.file = nil
+	}
+
+	r.finish()
 }
 
 // relistAfter replaces the remaining snapshot with every segment now on disk
@@ -316,9 +367,16 @@ func (r *Reader) Entry() Entry { return r.current }
 // Err returns the first error encountered, or nil at a clean end of the cursor.
 func (r *Reader) Err() error { return r.err }
 
-// Close releases the reader's resources. It is safe to call more than once.
+// Close releases the reader's resources, including an offered file it never
+// read. A retained file is left for takeRetained. It is safe to call more than
+// once.
 func (r *Reader) Close() error {
 	r.finish()
+
+	if r.offered != nil {
+		_ = r.offered.Close()
+		r.offered, r.offeredName = nil, ""
+	}
 
 	return nil
 }

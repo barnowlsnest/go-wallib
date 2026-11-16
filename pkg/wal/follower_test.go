@@ -496,3 +496,24 @@ func (s *FollowerSuite) TestFollowResumesWhereItStopped() {
 		})
 	}
 }
+
+// A follow-mode follower keeps its segment file open between wakes and closes
+// it when following ends.
+func (s *FollowerSuite) TestFollowClosesHeldFileWhenItEnds() {
+	w := s.appendSequential(3)
+	defer func() { _ = w.Close() }()
+
+	follower, err := w.Follower(1, WithFollow())
+	s.Require().NoError(err)
+	defer func() { _ = follower.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	entries := follower.RecordsChan(ctx)
+	s.Require().Equal(lsnRange(1, 3), s.receive(entries, 3))
+
+	cancel()
+	for range entries {
+	}
+
+	s.Require().Nil(follower.held, "held segment file not closed")
+}
