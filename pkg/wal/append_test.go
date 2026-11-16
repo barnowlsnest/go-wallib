@@ -3,9 +3,15 @@ package wal
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
+
+	"github.com/barnowlsnest/go-wallib/internal/record"
+	"github.com/barnowlsnest/go-wallib/internal/segment"
 )
 
 // realistic append payloads.
@@ -120,4 +126,147 @@ func (s *AppendSuite) TestAppendPersistsAcrossReopen() {
 	s.Require().Equal(uint64(3), report.EntriesRecovered)
 	s.Require().Equal(uint64(1), report.FirstLSN)
 	s.Require().Equal(uint64(3), report.LastLSN)
+}
+
+// newTestRequest builds an append request as AppendBatch would, for tests that
+// hand several requests to commit as one group.
+func newTestRequest(payloads ...[]byte) *appendRequest {
+	return &appendRequest{
+		ctx:      context.Background(),
+		resultCh: make(chan appendResult, 1),
+		payloads: payloads,
+	}
+}
+
+// readAll returns every entry from a reopened log in dir.
+func (s *AppendSuite) readAll() (lsns []uint64, payloads [][]byte) {
+	s.T().Helper()
+
+	w := s.open()
+	defer func() { s.Require().NoError(w.Close()) }()
+
+	reader, err := w.NewReader(w.FirstLSN())
+	s.Require().NoError(err)
+	defer func() { s.Require().NoError(reader.Close()) }()
+
+	for reader.Next() {
+		entry := reader.Entry()
+		lsns = append(lsns, entry.LSN)
+		payloads = append(payloads, bytes.Clone(entry.Payload))
+	}
+	s.Require().NoError(reader.Err())
+
+	return lsns, payloads
+}
+
+// A batch larger than writeBufferLimit is written out early, and a roll inside
+// the batch writes the staged records to the old segment first; either way every
+// record lands once, in order.
+func (s *AppendSuite) TestAppendBatchFlushesEarly() {
+	const recordSize = 1 << 20
+	payloads := make([][]byte, 5)
+	for i := range payloads {
+		payloads[i] = bytes.Repeat(fmt.Appendf(nil, "snapshot-chunk-%d;", i), recordSize/17)
+	}
+
+	tests := []struct {
+		name             string
+		maxSegmentSize   int64
+		expectedSegments int
+	}{
+		{name: "one segment", maxSegmentSize: 64 << 20, expectedSegments: 1},
+		{name: "rolls every two records", maxSegmentSize: 5 << 19, expectedSegments: 3},
+	}
+
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			s.dir = s.T().TempDir()
+			w := s.open(WithSyncPolicy(SyncBatched), WithMaxSegmentSize(tc.maxSegmentSize))
+
+			actualLSNs, err := w.AppendBatch(context.Background(), payloads)
+			s.Require().NoError(err)
+			s.Require().Equal([]uint64{1, 2, 3, 4, 5}, actualLSNs)
+			s.Require().Equal(tc.expectedSegments, w.segmentCount())
+			s.Require().NoError(w.Close())
+
+			readLSNs, readPayloads := s.readAll()
+			s.Require().Equal([]uint64{1, 2, 3, 4, 5}, readLSNs)
+			s.Require().Equal(payloads, readPayloads)
+		})
+	}
+}
+
+// When writing a group's staged records fails, every request in the group fails
+// and their LSNs are handed out again by the next append.
+func (s *AppendSuite) TestWriteFailureFailsWholeBatch() {
+	w := s.open(WithSyncPolicy(SyncBatched))
+
+	_, err := w.Append(context.Background(), appendSetCommand)
+	s.Require().NoError(err)
+
+	// A closed file makes the group's single write fail.
+	s.Require().NoError(w.active.Close())
+	group := []*appendRequest{
+		newTestRequest(appendDeleteCommand),
+		newTestRequest(appendSetCommand, appendSnapshotChunk),
+	}
+	w.commit(group)
+
+	for _, request := range group {
+		actual := <-request.resultCh
+		s.Require().Error(actual.err)
+		s.Require().Nil(actual.assignedLSNs)
+	}
+	s.Require().Equal(uint64(1), w.LastLSN())
+	s.Require().Equal(uint64(2), w.nextLSN)
+
+	// With a working handle on the same file, the next append reuses LSN 2.
+	reopened, err := segment.Open(w.root, w.active.BaseLSN())
+	s.Require().NoError(err)
+	w.mu.Lock()
+	w.active = reopened
+	w.mu.Unlock()
+
+	actualLSNs, err := w.AppendBatch(context.Background(), [][]byte{appendDeleteCommand, appendSetCommand})
+	s.Require().NoError(err)
+	s.Require().Equal([]uint64{2, 3}, actualLSNs)
+	s.Require().NoError(w.Close())
+
+	readLSNs, readPayloads := s.readAll()
+	s.Require().Equal([]uint64{1, 2, 3}, readLSNs)
+	s.Require().Equal([][]byte{appendSetCommand, appendDeleteCommand, appendSetCommand}, readPayloads)
+}
+
+// A request that fails on its own (here a roll whose new segment cannot be
+// created) fails alone: the earlier request in the group, written out by that
+// roll, is kept exactly once, and the failed request's LSN is reused.
+func (s *AppendSuite) TestFailedRollFailsOnlyThatRequest() {
+	// One record fills a segment, so the second request's first record rolls.
+	w := s.open(
+		WithSyncPolicy(SyncBatched),
+		WithMaxSegmentSize(int64(segment.HeaderSize+record.EncodedSize(len(appendSetCommand)))),
+	)
+
+	// A file already named for the next segment makes the roll's create fail.
+	blocker := filepath.Join(s.dir, segment.Name(2))
+	s.Require().NoError(os.WriteFile(blocker, nil, 0o600))
+
+	first, second := newTestRequest(appendSetCommand), newTestRequest(appendDeleteCommand)
+	w.commit([]*appendRequest{first, second})
+
+	actualFirst, actualSecond := <-first.resultCh, <-second.resultCh
+	s.Require().NoError(actualFirst.err)
+	s.Require().Equal([]uint64{1}, actualFirst.assignedLSNs)
+	s.Require().Error(actualSecond.err)
+	s.Require().Equal(uint64(1), w.LastLSN())
+
+	s.Require().NoError(os.Remove(blocker))
+	lsn, err := w.Append(context.Background(), appendDeleteCommand)
+	s.Require().NoError(err)
+	s.Require().Equal(uint64(2), lsn)
+	s.Require().NoError(w.Close())
+
+	readLSNs, readPayloads := s.readAll()
+	s.Require().Equal([]uint64{1, 2}, readLSNs)
+	s.Require().Equal([][]byte{appendSetCommand, appendDeleteCommand}, readPayloads)
 }

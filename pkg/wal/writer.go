@@ -2,6 +2,7 @@ package wal
 
 import (
 	"context"
+	"errors"
 	"os"
 	"slices"
 	"time"
@@ -9,6 +10,10 @@ import (
 	"github.com/barnowlsnest/go-wallib/internal/record"
 	"github.com/barnowlsnest/go-wallib/internal/segment"
 )
+
+// writeBufferLimit is how many staged bytes a commit holds before it writes them
+// out early, which bounds the memory a large batch copies.
+const writeBufferLimit = 4 << 20
 
 // appendRequest is a single append handed to the writer goroutine.
 type appendRequest struct {
@@ -241,10 +246,16 @@ func (w *WAL) drain() {
 
 // commit writes a batch of append requests, fsyncs once per the active policy,
 // and delivers each request's result. It runs only on the writer goroutine.
+//
+// The records of every request are staged in one buffer and written with one
+// write per segment (or per writeBufferLimit bytes). If such a write fails, every
+// request in the batch fails, as it does when the batch's fsync fails.
 func (w *WAL) commit(batch []*appendRequest) {
 	results := make([]appendResult, len(batch))
 	wroteAny := false
+	w.stagedFromLSN = w.nextLSN
 
+	var writeErr error
 	for i, request := range batch {
 		if err := request.ctx.Err(); err != nil {
 			results[i] = appendResult{err: err}
@@ -253,6 +264,11 @@ func (w *WAL) commit(batch []*appendRequest) {
 		}
 
 		assignedLSNs, err := w.writeRequest(request)
+		if failed, ok := errors.AsType[*writeFailure](err); ok {
+			writeErr = failed.err
+
+			break
+		}
 		if err != nil {
 			results[i] = appendResult{err: err}
 
@@ -263,13 +279,58 @@ func (w *WAL) commit(batch []*appendRequest) {
 		wroteAny = true
 	}
 
-	if wroteAny {
+	if writeErr == nil && wroteAny {
+		var failed *writeFailure
+		if errors.As(w.flushStaged(), &failed) {
+			writeErr = failed.err
+		}
+	}
+
+	switch {
+	case writeErr != nil:
+		failPending(results, writeErr)
+	case wroteAny:
 		w.finishBatch(results)
 	}
 
 	for i, request := range batch {
 		request.resultCh <- results[i]
 	}
+}
+
+// writeFailure marks an error from writing staged records to the file, which
+// fails the whole batch rather than one request.
+type writeFailure struct {
+	err error
+}
+
+func (f *writeFailure) Error() string { return f.err.Error() }
+
+func (f *writeFailure) Unwrap() error { return f.err }
+
+// failPending gives err to every request in results that has no error yet,
+// including those the batch never reached.
+func failPending(results []appendResult, err error) {
+	for i := range results {
+		if results[i].err == nil {
+			results[i] = appendResult{err: err}
+		}
+	}
+}
+
+// flushStaged writes the active segment's staged records with one write. If the
+// write fails the staged records are gone, so nextLSN moves back to the first of
+// them and those LSNs are assigned again by later appends, leaving no gap.
+func (w *WAL) flushStaged() error {
+	if err := w.active.Flush(); err != nil {
+		w.nextLSN = w.stagedFromLSN
+
+		return &writeFailure{err: err}
+	}
+
+	w.stagedFromLSN = w.nextLSN
+
+	return nil
 }
 
 // finishBatch fsyncs the group commit (unless the interval flusher owns
@@ -301,12 +362,20 @@ func (w *WAL) flushAfterCommit() error {
 	return w.active.Sync()
 }
 
-// writeRequest appends every payload in one request, assigning gapless LSNs.
+// writeRequest stages every payload in one request, assigning gapless LSNs. If a
+// record fails for this request alone (a roll or encode error), the request's
+// records that are still staged are dropped and their LSNs reused; any part
+// already written by an earlier flush in this request stays.
 func (w *WAL) writeRequest(request *appendRequest) ([]uint64, error) {
+	startLSN, keep := w.nextLSN, w.active.Staged()
 	assignedLSNs := make([]uint64, 0, len(request.payloads))
 	for _, payload := range request.payloads {
 		lsn := w.nextLSN
 		if err := w.writeRecord(lsn, payload); err != nil {
+			if _, ok := errors.AsType[*writeFailure](err); !ok {
+				w.dropStaged(startLSN, keep)
+			}
+
 			return nil, err
 		}
 
@@ -317,23 +386,50 @@ func (w *WAL) writeRequest(request *appendRequest) ([]uint64, error) {
 	return assignedLSNs, nil
 }
 
-// writeRecord applies the segment-roll rule, then appends one record to the
-// active segment.
+// dropStaged undoes the staging done by a failed request that started at
+// startLSN with keep bytes already staged. If a flush ran since then (including
+// one by a roll right at the request's first record), everything staged now
+// belongs to that request; when stagedFromLSN equals startLSN with no flush,
+// keep is already zero.
+func (w *WAL) dropStaged(startLSN uint64, keep int) {
+	if w.stagedFromLSN >= startLSN {
+		startLSN, keep = w.stagedFromLSN, 0
+	}
+
+	w.active.Discard(keep, startLSN-1)
+	w.nextLSN = startLSN
+}
+
+// writeRecord applies the segment-roll rule, then stages one record in the
+// active segment, writing the staged records out once they reach
+// writeBufferLimit.
 func (w *WAL) writeRecord(lsn uint64, payload []byte) error {
 	needed := int64(record.EncodedSize(len(payload)))
-	if w.active.Size() > segment.HeaderSize && w.active.Size()+needed > w.opts.maxSegmentSize {
+	size := w.active.Size() + int64(w.active.Staged())
+	if size > segment.HeaderSize && size+needed > w.opts.maxSegmentSize {
 		if err := w.roll(lsn); err != nil {
 			return err
 		}
 	}
 
-	_, err := w.active.Append(lsn, payload)
+	if err := w.active.Stage(lsn, payload); err != nil {
+		return err
+	}
 
-	return err
+	if w.active.Staged() >= writeBufferLimit {
+		return w.flushStaged()
+	}
+
+	return nil
 }
 
-// roll seals the active segment and starts a fresh one based at baseLSN.
+// roll writes the active segment's staged records, seals it and starts a fresh
+// one based at baseLSN.
 func (w *WAL) roll(baseLSN uint64) error {
+	if err := w.flushStaged(); err != nil {
+		return err
+	}
+
 	if err := w.active.Sync(); err != nil {
 		return err
 	}
