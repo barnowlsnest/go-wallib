@@ -329,8 +329,25 @@ func (w *WAL) flushStaged() error {
 	}
 
 	w.stagedFromLSN = w.nextLSN
+	w.publishIndex()
 
 	return nil
+}
+
+// publishIndex makes the index entries of records the active segment has
+// written visible to readers. It runs on the writer goroutine, the only one
+// that changes indexes, so reading the map here needs no lock. Appending never
+// changes the entries a reader may be searching, only adds past them.
+func (w *WAL) publishIndex() {
+	baseLSN := w.active.BaseLSN()
+	written, published := w.active.Index(), w.indexes[baseLSN]
+	if len(written) == len(published) {
+		return
+	}
+
+	w.mu.Lock()
+	w.indexes[baseLSN] = append(published, written[len(published):]...)
+	w.mu.Unlock()
 }
 
 // finishBatch fsyncs the group commit (unless the interval flusher owns
@@ -508,6 +525,9 @@ func (w *WAL) doTruncate(upTo uint64) error {
 	}
 
 	w.mu.Lock()
+	for _, baseLSN := range baseLSNs[:deletable] {
+		delete(w.indexes, baseLSN)
+	}
 	w.segmentBaseLSNs = w.segmentBaseLSNs[deletable:]
 	newFirstLSN := w.segmentBaseLSNs[0]
 	w.firstLSN = newFirstLSN
@@ -637,6 +657,9 @@ func (w *WAL) cutDeleteBelow(baseLSNs []uint64, boundary int, cut uint64) error 
 	}
 
 	w.mu.Lock()
+	for _, baseLSN := range baseLSNs[:boundary] {
+		delete(w.indexes, baseLSN)
+	}
 	w.segmentBaseLSNs = w.segmentBaseLSNs[boundary:]
 	w.firstLSN = cut
 	w.mu.Unlock()
@@ -679,6 +702,12 @@ func (w *WAL) cutRewriteBoundary(baseLSNs []uint64, boundary int, cut uint64) er
 
 	w.mu.Lock()
 	oldActive := w.active
+	for _, baseLSN := range baseLSNs[:boundary+1] {
+		delete(w.indexes, baseLSN)
+	}
+	if index := replacement.Index(); len(index) > 0 {
+		w.indexes[cut] = slices.Clone(index)
+	}
 	w.segmentBaseLSNs = append([]uint64{cut}, w.segmentBaseLSNs[boundary+1:]...)
 	w.firstLSN = cut
 	if isActive {
@@ -731,6 +760,7 @@ func (w *WAL) cutEverything(baseLSNs []uint64, nextLSN uint64) error {
 	oldActive := w.active
 	w.active = replacement
 	w.segmentBaseLSNs = []uint64{nextLSN}
+	w.indexes = make(map[uint64][]segment.IndexEntry)
 	w.firstLSN = 0
 	w.mu.Unlock()
 

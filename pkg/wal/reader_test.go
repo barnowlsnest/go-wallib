@@ -292,3 +292,136 @@ func (s *ReaderSuite) TestReaderStartsInSegmentHoldingFromLSN() {
 		})
 	}
 }
+
+// indexedPayload is payloadForLSN padded to about 1 KiB, so a few hundred
+// records span several index entries.
+func indexedPayload(lsn uint64) []byte {
+	return append(payloadForLSN(lsn), make([]byte, 1000)...)
+}
+
+// appendIndexed appends count indexedPayload records in batches of 16.
+func (s *ReaderSuite) appendIndexed(w *WAL, count int) {
+	s.T().Helper()
+
+	for count > 0 {
+		batch := make([][]byte, 0, min(count, 16))
+		for lsn := w.LastLSN() + 1; len(batch) < cap(batch); lsn++ {
+			batch = append(batch, indexedPayload(lsn))
+		}
+
+		_, err := w.AppendBatch(context.Background(), batch)
+		s.Require().NoError(err)
+		count -= len(batch)
+	}
+}
+
+// TestReaderStartsFromIndex checks that a reader near the tail starts at the
+// indexed offset instead of the segment start, and still reads the right
+// records, however the segment and its index came about.
+func (s *ReaderSuite) TestReaderStartsFromIndex() {
+	testCases := []struct {
+		name  string
+		build func() *WAL
+	}{
+		{name: "live appends", build: func() *WAL {
+			w := s.appendSequential(0)
+			s.appendIndexed(w, 300)
+
+			return w
+		}},
+		{name: "after reopen", build: func() *WAL {
+			w := s.appendSequential(0)
+			s.appendIndexed(w, 300)
+			s.Require().NoError(w.Close())
+
+			reopened, _, err := Open(s.dir, WithSyncPolicy(SyncImmediate))
+			s.Require().NoError(err)
+
+			return reopened
+		}},
+		{name: "after roll", build: func() *WAL {
+			w := s.appendSequential(0, WithMaxSegmentSize(256<<10))
+			s.appendIndexed(w, 600)
+			s.Require().GreaterOrEqual(w.segmentCount(), 3)
+
+			return w
+		}},
+		{name: "after cut rewrites the active segment", build: func() *WAL {
+			w := s.appendSequential(0)
+			s.appendIndexed(w, 300)
+			s.Require().NoError(w.CutOffset(100))
+			s.appendIndexed(w, 100)
+
+			return w
+		}},
+		{name: "after truncate", build: func() *WAL {
+			w := s.appendSequential(0, WithMaxSegmentSize(128<<10))
+			s.appendIndexed(w, 600)
+			s.Require().NoError(w.Truncate(400))
+			s.Require().Greater(w.FirstLSN(), uint64(1))
+
+			return w
+		}},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			s.SetupTest()
+
+			w := tc.build()
+			defer func() { s.Require().NoError(w.Close()) }()
+
+			s.requireIndexesMatchSegments(w)
+
+			lastLSN := w.LastLSN()
+			fromLSN := lastLSN - 5
+
+			start := w.indexedPosition(fromLSN)
+			s.Require().Greater(start.offset, int64(segment.HeaderSize), "no index entry at or below LSN %d", fromLSN)
+
+			reader, err := w.NewReader(fromLSN)
+			s.Require().NoError(err)
+			defer func() { s.Require().NoError(reader.Close()) }()
+			s.Require().Equal(start.offset, reader.startOffset)
+
+			entries := s.collect(reader)
+			s.Require().Len(entries, int(lastLSN-fromLSN+1))
+			for i, entry := range entries {
+				expectedLSN := fromLSN + uint64(i)
+				s.Require().Equal(expectedLSN, entry.LSN)
+				s.Require().Equal(indexedPayload(expectedLSN), entry.Payload)
+			}
+		})
+	}
+}
+
+// A reader from before the first index entry, or from the beginning, still
+// starts at the segment header.
+func (s *ReaderSuite) TestReaderBeforeFirstIndexEntryStartsAtHeader() {
+	w := s.appendSequential(0)
+	defer func() { s.Require().NoError(w.Close()) }()
+	s.appendIndexed(w, 300)
+
+	for _, fromLSN := range []uint64{0, 1, 2} {
+		s.Require().Equal(readerPosition{}, w.indexedPosition(fromLSN), "from LSN %d", fromLSN)
+
+		reader, err := w.NewReader(fromLSN)
+		s.Require().NoError(err)
+		s.Require().Equal(int64(0), reader.startOffset)
+		s.Require().Len(s.collect(reader), 300-int(max(fromLSN, 1))+1)
+		s.Require().NoError(reader.Close())
+	}
+}
+
+// requireIndexesMatchSegments checks that the WAL keeps an index only for
+// segments it still has.
+func (s *ReaderSuite) requireIndexesMatchSegments(w *WAL) {
+	s.T().Helper()
+
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	for baseLSN := range w.indexes {
+		s.Require().Contains(w.segmentBaseLSNs, baseLSN, "index kept for removed segment %d", baseLSN)
+	}
+}

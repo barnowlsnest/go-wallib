@@ -17,7 +17,12 @@ type Segment struct {
 	file *os.File
 	name string
 	// staged holds encoded records that Stage added and Flush has not written yet.
-	staged        []byte
+	staged []byte
+	// index holds an entry every IndexInterval bytes for the records in the
+	// file; stagedIndex holds the entries for staged records until Flush writes
+	// them, so a record that never reaches the file is never indexed.
+	index         []IndexEntry
+	stagedIndex   []IndexEntry
 	baseLSN       uint64
 	size          int64  // total bytes written, including the header
 	lastLSN       uint64 // highest record LSN; baseLSN-1 when the segment is empty
@@ -147,6 +152,10 @@ func (s *Segment) Size() int64 { return s.size }
 // LastLSN returns the highest record LSN written so far, or baseLSN-1 when empty.
 func (s *Segment) LastLSN() uint64 { return s.lastLSN }
 
+// Index returns the index entries for the records written to the file, in LSN
+// order. The caller must not modify it.
+func (s *Segment) Index() []IndexEntry { return s.index }
+
 // Append encodes and writes a single record at the end of the segment. It does
 // not fsync; call Sync to flush.
 func (s *Segment) Append(lsn uint64, payload []byte) (int, error) {
@@ -159,6 +168,10 @@ func (s *Segment) Append(lsn uint64, payload []byte) (int, error) {
 		return 0, err
 	}
 
+	if indexDue(s.index, s.size) {
+		s.index = append(s.index, IndexEntry{LSN: lsn, Offset: s.size})
+	}
+
 	s.size += int64(len(encoded))
 	s.lastLSN = lsn
 
@@ -168,9 +181,18 @@ func (s *Segment) Append(lsn uint64, payload []byte) (int, error) {
 // Stage encodes one record into the segment's write buffer. Nothing reaches the
 // file until Flush, so many records cost one write instead of one each.
 func (s *Segment) Stage(lsn uint64, payload []byte) error {
+	offset := s.size + int64(len(s.staged))
 	staged, err := record.Encode(s.staged, lsn, payload)
 	if err != nil {
 		return err
+	}
+
+	lastIndexed := s.index
+	if len(s.stagedIndex) > 0 {
+		lastIndexed = s.stagedIndex
+	}
+	if indexDue(lastIndexed, offset) {
+		s.stagedIndex = append(s.stagedIndex, IndexEntry{LSN: lsn, Offset: offset})
 	}
 
 	s.staged = staged
@@ -188,6 +210,11 @@ func (s *Segment) Staged() int { return len(s.staged) }
 func (s *Segment) Discard(keep int, lastLSN uint64) {
 	s.staged = s.staged[:keep]
 	s.stagedLastLSN = lastLSN
+
+	end := s.size + int64(keep)
+	for len(s.stagedIndex) > 0 && s.stagedIndex[len(s.stagedIndex)-1].Offset >= end {
+		s.stagedIndex = s.stagedIndex[:len(s.stagedIndex)-1]
+	}
 }
 
 // Flush writes every staged record at the end of the segment with one write. It
@@ -203,9 +230,11 @@ func (s *Segment) Flush() error {
 	if err == nil {
 		s.size += int64(len(s.staged))
 		s.lastLSN = s.stagedLastLSN
+		s.index = append(s.index, s.stagedIndex...)
 	}
 
 	s.staged = s.staged[:0]
+	s.stagedIndex = s.stagedIndex[:0]
 	if cap(s.staged) > maxRetainedStaged {
 		s.staged = nil
 	}
@@ -216,17 +245,26 @@ func (s *Segment) Flush() error {
 // Sync fsyncs the segment file.
 func (s *Segment) Sync() error { return s.file.Sync() }
 
-// Scan reads every record after the header, validating each. On a torn or
-// corrupt record it stops early; ValidEnd marks the safe truncation point for
-// tail recovery.
+// Scan reads every record after the header, validating each, and rebuilds the
+// index from them. On a torn or corrupt record it stops early; ValidEnd marks
+// the safe truncation point for tail recovery, and nothing past it is indexed.
 func (s *Segment) Scan(maxRecordSize int) ScanResult {
 	section := io.NewSectionReader(s.file, HeaderSize, s.size-HeaderSize)
 	scanner := record.NewScanner(bufio.NewReader(section), maxRecordSize)
 
 	var result ScanResult
-	for scanner.Next() {
+	s.index = nil
+	for {
+		offset := HeaderSize + scanner.Offset()
+		if !scanner.Next() {
+			break
+		}
+
 		result.Records++
 		result.LastLSN = scanner.Record().LSN
+		if indexDue(s.index, offset) {
+			s.index = append(s.index, IndexEntry{LSN: result.LastLSN, Offset: offset})
+		}
 	}
 
 	result.ValidEnd = HeaderSize + scanner.Offset()

@@ -1,6 +1,7 @@
 package segment
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -287,4 +288,221 @@ func (s *SegmentSuite) TestRewriteFromOverwritesStaleTemp() {
 	s.Require().NoError(dst.Close())
 	s.Require().NoError(src.Close())
 	s.Require().Equal(uint64(1), dst.LastLSN())
+}
+
+// indexPayload is large enough that a few hundred records span several
+// IndexInterval steps.
+var indexPayload = make([]byte, 1024)
+
+// indexRecordCount records of indexPayload fill about 300 KiB, so an index over
+// them holds several entries.
+const indexRecordCount = 300
+
+// TestIndexCoversWrittenRecords checks the index of a segment however its
+// records got there: each entry names the record that starts at its offset, and
+// entries are one IndexInterval apart, give or take one record.
+func (s *SegmentSuite) TestIndexCoversWrittenRecords() {
+	testCases := []struct {
+		name  string
+		build func(baseLSN uint64) *Segment
+		// skipped is how many records at the start of the segment the build
+		// leaves out.
+		skipped uint64
+	}{
+		{name: "staged and flushed once", build: s.stagedSegment(indexRecordCount)},
+		{name: "staged and flushed in parts", build: s.stagedSegment(10)},
+		{name: "appended", build: s.appendedSegment},
+		{name: "scanned after reopen", build: s.rescannedSegment},
+		{name: "rewritten by a cut", build: s.rewrittenSegment(100), skipped: 100},
+	}
+
+	for i, tc := range testCases {
+		s.Run(tc.name, func() {
+			baseLSN := uint64(i*1000 + 1)
+			seg := tc.build(baseLSN)
+			defer func() { s.Require().NoError(seg.Close()) }()
+
+			s.requireIndexMatchesFile(seg, baseLSN+tc.skipped)
+		})
+	}
+}
+
+// Staged records are not indexed until Flush writes them.
+func (s *SegmentSuite) TestIndexWaitsForFlush() {
+	seg, err := Create(s.root, 1)
+	s.Require().NoError(err)
+	defer func() { s.Require().NoError(seg.Close()) }()
+
+	for lsn := uint64(1); lsn <= indexRecordCount; lsn++ {
+		s.Require().NoError(seg.Stage(lsn, indexPayload))
+	}
+	s.Require().Empty(seg.Index())
+
+	s.Require().NoError(seg.Flush())
+	s.Require().NotEmpty(seg.Index())
+}
+
+// Discarded or unwritten staged records leave no index entries behind, so
+// records staged again under the same LSNs are indexed at their real offsets.
+func (s *SegmentSuite) TestIndexDropsUnwrittenStaged() {
+	testCases := []struct {
+		name    string
+		discard func(seg *Segment)
+	}{
+		{name: "discard", discard: func(seg *Segment) { seg.Discard(0, 0) }},
+		{name: "failed flush", discard: func(seg *Segment) {
+			// A closed file makes the write fail; a fresh handle on the same
+			// file lets the segment carry on.
+			s.Require().NoError(seg.file.Close())
+			s.Require().Error(seg.Flush())
+
+			file, err := s.root.OpenFile(seg.Name(), os.O_RDWR, 0)
+			s.Require().NoError(err)
+			seg.file = file
+		}},
+	}
+
+	for i, tc := range testCases {
+		s.Run(tc.name, func() {
+			baseLSN := uint64(i*1000 + 1)
+			seg, err := Create(s.root, baseLSN)
+			s.Require().NoError(err)
+			defer func() { s.Require().NoError(seg.Close()) }()
+
+			s.Require().NoError(seg.Stage(baseLSN, segSetCommand))
+			s.Require().NoError(seg.Flush())
+
+			s.stageRange(seg, baseLSN+1, baseLSN+indexRecordCount)
+			tc.discard(seg)
+			s.Require().Equal(0, seg.Staged())
+
+			s.Require().NoError(seg.Flush())
+			s.Require().Empty(seg.Index())
+
+			s.stageRange(seg, baseLSN+1, baseLSN+indexRecordCount)
+			s.Require().NoError(seg.Flush())
+			s.requireIndexMatchesFile(seg, baseLSN)
+		})
+	}
+}
+
+func (s *SegmentSuite) TestLookup() {
+	index := []IndexEntry{{LSN: 100, Offset: 70_000}, {LSN: 200, Offset: 140_000}}
+
+	testCases := []struct {
+		name           string
+		index          []IndexEntry
+		lsn            uint64
+		expectedOffset int64
+		expectedOK     bool
+	}{
+		{name: "empty index", lsn: 150},
+		{name: "below first entry", index: index, lsn: 99},
+		{name: "on an entry", index: index, lsn: 100, expectedOffset: 70_000, expectedOK: true},
+		{name: "between entries", index: index, lsn: 199, expectedOffset: 70_000, expectedOK: true},
+		{name: "above last entry", index: index, lsn: 1_000, expectedOffset: 140_000, expectedOK: true},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			actualOffset, actualOK := Lookup(tc.index, tc.lsn)
+
+			s.Require().Equal(tc.expectedOK, actualOK)
+			s.Require().Equal(tc.expectedOffset, actualOffset)
+		})
+	}
+}
+
+// stageRange stages one indexPayload record for every LSN in [from, to].
+func (s *SegmentSuite) stageRange(seg *Segment, from, to uint64) {
+	s.T().Helper()
+
+	for lsn := from; lsn <= to; lsn++ {
+		s.Require().NoError(seg.Stage(lsn, indexPayload))
+	}
+}
+
+// stagedSegment writes indexRecordCount records with Stage, flushing every
+// flushEvery records.
+func (s *SegmentSuite) stagedSegment(flushEvery uint64) func(baseLSN uint64) *Segment {
+	return func(baseLSN uint64) *Segment {
+		seg, err := Create(s.root, baseLSN)
+		s.Require().NoError(err)
+
+		for n := uint64(1); n <= indexRecordCount; n++ {
+			s.Require().NoError(seg.Stage(baseLSN+n-1, indexPayload))
+			if n%flushEvery == 0 {
+				s.Require().NoError(seg.Flush())
+			}
+		}
+		s.Require().NoError(seg.Flush())
+
+		return seg
+	}
+}
+
+func (s *SegmentSuite) appendedSegment(baseLSN uint64) *Segment {
+	seg, err := Create(s.root, baseLSN)
+	s.Require().NoError(err)
+
+	for lsn := baseLSN; lsn < baseLSN+indexRecordCount; lsn++ {
+		_, appendErr := seg.Append(lsn, indexPayload)
+		s.Require().NoError(appendErr)
+	}
+
+	return seg
+}
+
+func (s *SegmentSuite) rescannedSegment(baseLSN uint64) *Segment {
+	written := s.appendedSegment(baseLSN)
+	s.Require().NoError(written.Close())
+
+	seg, err := Open(s.root, baseLSN)
+	s.Require().NoError(err)
+	s.Require().NoError(seg.Scan(segMaxRecordBytes).Err)
+
+	return seg
+}
+
+// rewrittenSegment rewrites an appended segment from the record skip places
+// past its base.
+func (s *SegmentSuite) rewrittenSegment(skip uint64) func(baseLSN uint64) *Segment {
+	return func(baseLSN uint64) *Segment {
+		src := s.appendedSegment(baseLSN)
+		defer func() { s.Require().NoError(src.Close()) }()
+
+		seg, err := RewriteFrom(s.root, src, baseLSN+skip, segMaxRecordBytes)
+		s.Require().NoError(err)
+
+		return seg
+	}
+}
+
+// requireIndexMatchesFile checks that seg's index is non-empty, that every
+// entry's offset in the file starts the record with the entry's LSN, and that
+// entries are spaced IndexInterval apart, give or take one record. firstLSN is
+// the segment's first record, which is never indexed: a reader reaches it from
+// the header anyway.
+func (s *SegmentSuite) requireIndexMatchesFile(seg *Segment, firstLSN uint64) {
+	s.T().Helper()
+
+	index := seg.Index()
+	s.Require().NotEmpty(index)
+
+	file, err := s.root.Open(seg.Name())
+	s.Require().NoError(err)
+	defer func() { s.Require().NoError(file.Close()) }()
+
+	previous := int64(HeaderSize)
+	for _, entry := range index {
+		gap := entry.Offset - previous
+		s.Require().GreaterOrEqual(gap, int64(IndexInterval), "entry for LSN %d", entry.LSN)
+		s.Require().Less(gap, int64(IndexInterval+record.EncodedSize(len(indexPayload))), "entry for LSN %d", entry.LSN)
+		s.Require().Greater(entry.LSN, firstLSN)
+		previous = entry.Offset
+
+		scanner := record.NewScanner(io.NewSectionReader(file, entry.Offset, seg.Size()-entry.Offset), segMaxRecordBytes)
+		s.Require().True(scanner.Next(), "no record at offset %d", entry.Offset)
+		s.Require().Equal(entry.LSN, scanner.Record().LSN)
+	}
 }

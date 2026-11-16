@@ -43,7 +43,10 @@ imported by other modules; open an issue if you need something they provide.
   batches all writes; the API is safe for concurrent use.
 - **Readers, replay & followers.** A forward `Reader` cursor, `Replay`
   callback, and `Follower` (`iter.Seq2` / channel) iterate committed entries
-  from any LSN — including live follow mode.
+  from any LSN — including live follow mode. A reader starts near its LSN
+  through an in-memory index of each segment, one entry per 64 KiB of
+  records, which `Open` builds during recovery, so reading from the middle
+  of a large segment does not scan it from the start.
 - Standard library only (plus an optional structured logger); no `unsafe`; all
   file access is confined to the log directory via `os.Root`.
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 
 	"github.com/barnowlsnest/go-wallib/internal/segment"
@@ -30,10 +31,14 @@ type WAL struct {
 	root            *os.Root
 	dir             string
 	segmentBaseLSNs []uint64
-	pendingWaiters  []chan struct{}
-	opts            options
-	wg              sync.WaitGroup
-	nextLSN         uint64
+	// indexes maps a segment's base LSN to its published index entries, so a
+	// reader can start near its LSN instead of at the segment start. Guarded by
+	// mu; only the writer goroutine changes it.
+	indexes        map[uint64][]segment.IndexEntry
+	pendingWaiters []chan struct{}
+	opts           options
+	wg             sync.WaitGroup
+	nextLSN        uint64
 	// stagedFromLSN is the LSN of the first record in the active segment's write
 	// buffer, i.e. nextLSN as of the last flush. Only the writer goroutine uses it.
 	stagedFromLSN uint64
@@ -165,6 +170,7 @@ func (w *WAL) initEmptyLog() (*RecoveryReport, error) {
 
 	w.active = seg
 	w.segmentBaseLSNs = []uint64{1}
+	w.indexes = make(map[uint64][]segment.IndexEntry)
 	w.nextLSN = 1
 
 	w.opts.logger.Info("wal: created new empty log", Field{Key: "dir", Value: w.dir})
@@ -324,8 +330,14 @@ func (w *WAL) removeOpened(report *RecoveryReport, opened openedSeg) error {
 func (w *WAL) installState(segments []openedSeg, firstLSN, lastLSN uint64) error {
 	lastIdx := len(segments) - 1
 	w.segmentBaseLSNs = make([]uint64, len(segments))
+	w.indexes = make(map[uint64][]segment.IndexEntry, len(segments))
 	for i, opened := range segments {
 		w.segmentBaseLSNs[i] = opened.seg.BaseLSN()
+		// Cloned so the active segment's own index can grow without sharing
+		// memory with the published copy readers search.
+		if index := opened.seg.Index(); len(index) > 0 {
+			w.indexes[opened.seg.BaseLSN()] = slices.Clone(index)
+		}
 		if i == lastIdx {
 			break
 		}
