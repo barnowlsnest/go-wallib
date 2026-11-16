@@ -109,6 +109,75 @@ func (s *SegmentSuite) TestAppendThenScan() {
 	s.Require().Equal(seg.Size(), result.ValidEnd)
 }
 
+// Staged records reach the file only on Flush, in one write, and Discard drops
+// the ones staged after a mark.
+func (s *SegmentSuite) TestStageThenFlush() {
+	payloads := [][]byte{segSetCommand, segDeleteCommand, segCheckpoint}
+	tests := []struct {
+		name string
+		keep int // records kept by Discard; len(payloads) keeps all of them
+	}{
+		{name: "flush all staged", keep: 3},
+		{name: "discard after the first", keep: 1},
+		{name: "discard everything", keep: 0},
+	}
+
+	for i, tc := range tests {
+		s.Run(tc.name, func() {
+			seg, err := Create(s.root, uint64(i*10+1))
+			s.Require().NoError(err)
+			defer func() { s.Require().NoError(seg.Close()) }()
+
+			keepBytes := 0
+			for n, payload := range payloads {
+				if n == tc.keep {
+					keepBytes = seg.Staged()
+				}
+				s.Require().NoError(seg.Stage(seg.BaseLSN()+uint64(n), payload))
+			}
+			if tc.keep == len(payloads) {
+				keepBytes = seg.Staged()
+			}
+			s.Require().Equal(int64(HeaderSize), seg.Size(), "staging must not write")
+
+			seg.Discard(keepBytes, seg.BaseLSN()+uint64(tc.keep)-1)
+			s.Require().NoError(seg.Flush())
+
+			expectedSize := int64(HeaderSize)
+			for _, payload := range payloads[:tc.keep] {
+				expectedSize += int64(record.EncodedSize(len(payload)))
+			}
+			s.Require().Equal(0, seg.Staged())
+			s.Require().Equal(expectedSize, seg.Size())
+			s.Require().Equal(seg.BaseLSN()+uint64(tc.keep)-1, seg.LastLSN())
+
+			actual := seg.Scan(segMaxRecordBytes)
+			s.Require().NoError(actual.Err)
+			s.Require().Equal(uint64(tc.keep), actual.Records)
+			s.Require().Equal(expectedSize, actual.ValidEnd)
+		})
+	}
+}
+
+// A failed Flush drops the staged records and leaves the size and last LSN as
+// they were, so the next write lands at the same offset.
+func (s *SegmentSuite) TestFlushFailureDropsStaged() {
+	seg, err := Create(s.root, 1)
+	s.Require().NoError(err)
+
+	s.Require().NoError(seg.Stage(1, segSetCommand))
+	s.Require().NoError(seg.Flush())
+	expectedSize := seg.Size()
+
+	s.Require().NoError(seg.Stage(2, segDeleteCommand))
+	s.Require().NoError(seg.Close())
+
+	s.Require().Error(seg.Flush())
+	s.Require().Equal(0, seg.Staged())
+	s.Require().Equal(expectedSize, seg.Size())
+	s.Require().Equal(uint64(1), seg.LastLSN())
+}
+
 func (s *SegmentSuite) TestScanTornTailThenTruncate() {
 	seg, err := Create(s.root, 1)
 	s.Require().NoError(err)

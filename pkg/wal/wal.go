@@ -34,12 +34,15 @@ type WAL struct {
 	opts            options
 	wg              sync.WaitGroup
 	nextLSN         uint64
-	firstLSN        uint64
-	lastLSN         uint64
-	closeMu         sync.RWMutex
-	mu              sync.RWMutex
-	closeOnce       sync.Once
-	isClosed        bool
+	// stagedFromLSN is the LSN of the first record in the active segment's write
+	// buffer, i.e. nextLSN as of the last flush. Only the writer goroutine uses it.
+	stagedFromLSN uint64
+	firstLSN      uint64
+	lastLSN       uint64
+	closeMu       sync.RWMutex
+	mu            sync.RWMutex
+	closeOnce     sync.Once
+	isClosed      bool
 }
 
 // Open recovers an existing log in dir or creates a new one. It returns a

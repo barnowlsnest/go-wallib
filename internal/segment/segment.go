@@ -14,12 +14,20 @@ import (
 // single writable Segment. All file access is confined to the WAL directory via
 // the *os.Root the WAL holds.
 type Segment struct {
-	file    *os.File
-	name    string
-	baseLSN uint64
-	size    int64  // total bytes written, including the header
-	lastLSN uint64 // highest record LSN; baseLSN-1 when the segment is empty
+	file *os.File
+	name string
+	// staged holds encoded records that Stage added and Flush has not written yet.
+	staged        []byte
+	baseLSN       uint64
+	size          int64  // total bytes written, including the header
+	lastLSN       uint64 // highest record LSN; baseLSN-1 when the segment is empty
+	stagedLastLSN uint64 // highest LSN in staged
 }
+
+// maxRetainedStaged is the largest staged buffer kept for reuse after a Flush.
+// A larger one (left by an oversized record) is released so it is not held for
+// the life of the segment.
+const maxRetainedStaged = 8 << 20
 
 // ScanResult reports the outcome of scanning a segment's records.
 type ScanResult struct {
@@ -155,6 +163,54 @@ func (s *Segment) Append(lsn uint64, payload []byte) (int, error) {
 	s.lastLSN = lsn
 
 	return len(encoded), nil
+}
+
+// Stage encodes one record into the segment's write buffer. Nothing reaches the
+// file until Flush, so many records cost one write instead of one each.
+func (s *Segment) Stage(lsn uint64, payload []byte) error {
+	staged, err := record.Encode(s.staged, lsn, payload)
+	if err != nil {
+		return err
+	}
+
+	s.staged = staged
+	s.stagedLastLSN = lsn
+
+	return nil
+}
+
+// Staged returns the number of encoded bytes waiting for Flush.
+func (s *Segment) Staged() int { return len(s.staged) }
+
+// Discard drops the staged bytes from offset keep onward, undoing the Stage
+// calls made after Staged returned keep. lastLSN is the highest LSN still
+// staged; it is unused when keep is zero.
+func (s *Segment) Discard(keep int, lastLSN uint64) {
+	s.staged = s.staged[:keep]
+	s.stagedLastLSN = lastLSN
+}
+
+// Flush writes every staged record at the end of the segment with one write. It
+// does not fsync; call Sync for that. The staged records are dropped whether or
+// not the write succeeds: on failure the size is unchanged, so the next write
+// lands at the same offset over whatever part of this one reached the file.
+func (s *Segment) Flush() error {
+	if len(s.staged) == 0 {
+		return nil
+	}
+
+	_, err := s.file.WriteAt(s.staged, s.size)
+	if err == nil {
+		s.size += int64(len(s.staged))
+		s.lastLSN = s.stagedLastLSN
+	}
+
+	s.staged = s.staged[:0]
+	if cap(s.staged) > maxRetainedStaged {
+		s.staged = nil
+	}
+
+	return err
 }
 
 // Sync fsyncs the segment file.
