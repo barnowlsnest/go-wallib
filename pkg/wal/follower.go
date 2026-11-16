@@ -89,7 +89,13 @@ func (f *Follower) scanBatch(
 ) (result scanResult) {
 	expectedLSN := *highWater + 1
 	reader := newReaderFrom(f.wal.dir, segmentNames, expectedLSN, endLSN, f.maxRecord)
-	reader.resumeAt(f.resume)
+	// The first scan has no earlier position to resume from, so it starts at
+	// the index entry nearest its LSN instead of the segment start.
+	start := f.resume
+	if start.segmentName == "" {
+		start = f.wal.indexedPosition(expectedLSN)
+	}
+	reader.resumeAt(start)
 
 	defer func() {
 		if position := reader.lastPosition(); position.segmentName != "" {

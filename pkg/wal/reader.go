@@ -48,6 +48,11 @@ func (w *WAL) readerSnapshot() (segmentNames []string, endLSN, firstLSN uint64) 
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
+	return w.snapshotLocked()
+}
+
+// snapshotLocked is readerSnapshot for a caller holding mu.
+func (w *WAL) snapshotLocked() (segmentNames []string, endLSN, firstLSN uint64) {
 	segmentNames = make([]string, len(w.segmentBaseLSNs))
 	for i, baseLSN := range w.segmentBaseLSNs {
 		segmentNames[i] = segment.Name(baseLSN)
@@ -78,9 +83,41 @@ func (w *WAL) NewReader(fromLSN uint64) (*Reader, error) {
 		return nil, err
 	}
 
-	segmentNames, endLSN, _ := w.readerSnapshot()
+	w.mu.RLock()
+	segmentNames, endLSN, _ := w.snapshotLocked()
+	start := w.indexedPositionLocked(fromLSN)
+	w.mu.RUnlock()
 
-	return newReaderFrom(w.dir, segmentNames, fromLSN, endLSN, w.opts.maxRecordSize), nil
+	reader := newReaderFrom(w.dir, segmentNames, fromLSN, endLSN, w.opts.maxRecordSize)
+	reader.resumeAt(start)
+
+	return reader, nil
+}
+
+// indexedPosition returns where a reader from fromLSN can start: the indexed
+// record nearest at or below fromLSN in the segment holding it. It is empty when
+// no entry is at or below fromLSN, so reading starts at the segment header.
+func (w *WAL) indexedPosition(fromLSN uint64) readerPosition {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	return w.indexedPositionLocked(fromLSN)
+}
+
+// indexedPositionLocked is indexedPosition for a caller holding mu.
+func (w *WAL) indexedPositionLocked(fromLSN uint64) readerPosition {
+	above := sort.Search(len(w.segmentBaseLSNs), func(i int) bool { return w.segmentBaseLSNs[i] > fromLSN })
+	if above == 0 {
+		return readerPosition{}
+	}
+
+	baseLSN := w.segmentBaseLSNs[above-1]
+	offset, ok := segment.Lookup(w.indexes[baseLSN], fromLSN)
+	if !ok {
+		return readerPosition{}
+	}
+
+	return readerPosition{segmentName: segment.Name(baseLSN), offset: offset}
 }
 
 // Next advances to the next entry. It returns false at the end of the snapshot
