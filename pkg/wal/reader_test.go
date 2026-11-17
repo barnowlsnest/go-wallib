@@ -2,6 +2,7 @@ package wal
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -160,8 +161,8 @@ func (s *ReaderSuite) TestReaderSnapshotReportsBounds() {
 	w := s.appendSequential(3)
 	defer func() { _ = w.Close() }()
 
-	segmentNames, endLSN, firstLSN := w.readerSnapshot()
-	s.Require().NotEmpty(segmentNames)
+	segmentBases, endLSN, firstLSN := w.readerSnapshot()
+	s.Require().NotEmpty(segmentBases)
 	s.Assert().Equal(uint64(3), endLSN)
 	s.Assert().Equal(uint64(1), firstLSN)
 }
@@ -208,7 +209,10 @@ func (s *ReaderSuite) TestReaderSkipsOverlapLeftByInProgressCut() {
 
 	// A snapshot segment that has vanished forces the reader to re-list the
 	// directory, where it finds both overlapping segments.
-	reader := newReaderFrom(s.dir, []string{segment.Name(0)}, 0, 10, maxRecord)
+	handles := newReadHandles(root, s.dir, 1)
+	defer handles.close()
+
+	reader := newReaderFrom(handles, []uint64{0}, 0, 10, maxRecord)
 	defer func() { _ = reader.Close() }()
 
 	entries := s.collect(reader)
@@ -424,4 +428,105 @@ func (s *ReaderSuite) requireIndexesMatchSegments(w *WAL) {
 	for baseLSN := range w.indexes {
 		s.Require().Contains(w.segmentBaseLSNs, baseLSN, "index kept for removed segment %d", baseLSN)
 	}
+}
+
+// TestPayloadSurvivesReadBufferReuse checks that an Entry payload does not point
+// into a pooled read buffer: closing its Reader and reading other records
+// through a new Reader must leave it unchanged.
+func (s *ReaderSuite) TestPayloadSurvivesReadBufferReuse() {
+	w := s.appendSequential(20)
+	defer func() { s.Require().NoError(w.Close()) }()
+
+	first, err := w.NewReader(1)
+	s.Require().NoError(err)
+	s.Require().True(first.Next())
+	payload := first.Entry().Payload
+	s.Require().NoError(first.Close())
+
+	for range 4 {
+		other, readerErr := w.NewReader(10)
+		s.Require().NoError(readerErr)
+		s.collect(other)
+		s.Require().NoError(other.Close())
+	}
+
+	s.Require().Equal(payloadForLSN(1), payload)
+}
+
+// TestDamagedLengthBeforeFromLSNIsReported checks that a damaged length in a
+// record before fromLSN is reported, instead of sending the reader into the
+// middle of later records and ending the segment early.
+func (s *ReaderSuite) TestDamagedLengthBeforeFromLSNIsReported() {
+	w := s.appendSequential(5)
+	defer func() { s.Require().NoError(w.Close()) }()
+
+	// Damaged in place: reopening would make recovery truncate the segment.
+	root, err := os.OpenRoot(s.dir)
+	s.Require().NoError(err)
+	defer func() { _ = root.Close() }()
+
+	file, err := root.OpenFile(segment.Name(1), os.O_RDWR, 0)
+	s.Require().NoError(err)
+	defer func() { _ = file.Close() }()
+
+	lengthField := make([]byte, 4)
+	offset := int64(segment.HeaderSize + 4)
+	_, err = file.ReadAt(lengthField, offset)
+	s.Require().NoError(err)
+	binary.LittleEndian.PutUint32(lengthField, binary.LittleEndian.Uint32(lengthField)+1)
+	_, err = file.WriteAt(lengthField, offset)
+	s.Require().NoError(err)
+
+	reader, err := w.NewReader(3)
+	s.Require().NoError(err)
+	defer func() { _ = reader.Close() }()
+
+	s.Require().False(reader.Next())
+	s.Require().ErrorIs(reader.Err(), ErrCorrupt)
+}
+
+// TestSnapshotUnaffectedByLaterRollAndTruncate checks the snapshot shared with
+// the WAL (see snapshotLocked): rolling and truncating after it is taken leave
+// it unchanged, and it cannot be appended into the WAL's list.
+func (s *ReaderSuite) TestSnapshotUnaffectedByLaterRollAndTruncate() {
+	w := s.appendSequential(4, WithMaxSegmentSize(40))
+	defer func() { s.Require().NoError(w.Close()) }()
+
+	bases, _, _ := w.readerSnapshot()
+	want := slices.Clone(bases)
+	s.Require().Equal(len(bases), cap(bases))
+
+	for i := 5; i <= 8; i++ {
+		_, err := w.Append(context.Background(), payloadForLSN(uint64(i)))
+		s.Require().NoError(err)
+	}
+	s.Require().NoError(w.Truncate(6))
+
+	s.Require().Equal(want, bases)
+}
+
+// TestReadAllocationsDoNotGrowWithSegments checks that opening a reader on older
+// data, reading a record and closing it costs the same allocations whether the
+// log has a few segments or many: nothing is built per segment in the log.
+func (s *ReaderSuite) TestReadAllocationsDoNotGrowWithSegments() {
+	allocsFor := func(records int) float64 {
+		s.SetupTest()
+		w := s.appendSequential(records, WithMaxSegmentSize(40))
+		defer func() { s.Require().NoError(w.Close()) }()
+		s.Require().GreaterOrEqual(w.segmentCount(), records/2)
+
+		return testing.AllocsPerRun(20, func() {
+			reader, err := w.NewReader(2)
+			s.Require().NoError(err)
+			s.Require().True(reader.Next())
+			s.Require().NoError(reader.Close())
+		})
+	}
+
+	few, many := allocsFor(4), allocsFor(128)
+	s.T().Logf("allocations per read: %v with 4 segments, %v with 128", few, many)
+	// Under -race, sync.Pool drops some buffers on purpose, so a read may now and
+	// then allocate a fresh read buffer (two allocations). Anything built per
+	// segment would add over a hundred here.
+	s.Require().LessOrEqual(many, few+2)
 }

@@ -549,7 +549,11 @@ func (w *WAL) doTruncate(upTo uint64) error {
 // listing a base whose file was already removed) from wedging a later delete of
 // that base on a not-exist error, until recovery reconciles the index.
 func (w *WAL) removeSegmentFile(baseLSN uint64) error {
-	if err := w.root.Remove(segment.Name(baseLSN)); err != nil && !os.IsNotExist(err) {
+	w.handles.beginReplace(baseLSN)
+	err := w.root.Remove(segment.Name(baseLSN))
+	w.handles.endReplace(baseLSN)
+
+	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
 
@@ -687,7 +691,12 @@ func (w *WAL) cutRewriteBoundary(baseLSNs []uint64, boundary int, cut uint64) er
 		source = opened
 	}
 
+	// The rename inside RewriteFrom may replace an earlier seg-<cut> left by a
+	// failed cut, so no handle for that name may be cached across it.
+	w.handles.beginReplace(cut)
 	replacement, err := segment.RewriteFrom(w.root, source, cut, w.opts.maxRecordSize)
+	w.handles.endReplace(cut)
+
 	if err != nil {
 		return err
 	}
@@ -739,7 +748,11 @@ func (w *WAL) cutEverything(baseLSNs []uint64, nextLSN uint64) error {
 	// would block the exclusive create below. It holds no records (cut-everything
 	// only ever creates it empty), so removing it first is safe and lets a retry
 	// after a partial failure proceed instead of wedging on an already-exists error.
-	if err := w.root.Remove(segment.Name(nextLSN)); err != nil && !os.IsNotExist(err) {
+	w.handles.beginReplace(nextLSN)
+	err := w.root.Remove(segment.Name(nextLSN))
+	w.handles.endReplace(nextLSN)
+
+	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
 

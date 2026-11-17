@@ -61,6 +61,7 @@ const (
 	defaultBatchTimeout        = 2 * time.Millisecond
 	defaultFlushInterval       = 100 * time.Millisecond
 	defaultMaxOperationTimeout = 30 * time.Second
+	defaultMaxIdleReadHandles  = 64
 )
 
 // options holds the resolved configuration for a WAL. Fields are ordered to
@@ -74,6 +75,7 @@ type options struct {
 	batchTimeout        time.Duration
 	flushInterval       time.Duration
 	syncPolicy          SyncPolicy
+	maxIdleReadHandles  int
 }
 
 // defaultOptions returns the configuration used when no Option overrides it.
@@ -87,6 +89,7 @@ func defaultOptions() options {
 		flushInterval:       defaultFlushInterval,
 		syncPolicy:          SyncBatched,
 		maxOperationTimeout: defaultMaxOperationTimeout,
+		maxIdleReadHandles:  defaultMaxIdleReadHandles,
 	}
 }
 
@@ -125,6 +128,16 @@ func WithFlushInterval(period time.Duration) Option {
 
 func WithMaxOperationTimeout(timeout time.Duration) Option {
 	return func(o *options) { o.maxOperationTimeout = timeout }
+}
+
+// WithMaxIdleReadHandles caps how many segment files stay open for reading while
+// no Reader or Follower is using them. Readers share one descriptor per segment,
+// so moving into a segment that is already open costs no file open; past the
+// cap, the least recently used idle descriptor is closed. Descriptors in use do
+// not count and are never closed early. Default 64; Open returns
+// ErrInvalidOption for a value below 1.
+func WithMaxIdleReadHandles(count int) Option {
+	return func(o *options) { o.maxIdleReadHandles = count }
 }
 
 // WithLogger sets an optional logger. A nil logger is ignored, leaving the

@@ -190,3 +190,27 @@ func (s *ScannerSuite) TestOffsetAdvancesPerRecord() {
 	s.Require().NoError(scanner.Err())
 	s.Require().Equal(int64(len(encoded)), scanner.Offset())
 }
+
+// TestScanAllocationsDoNotGrowWithRecords guards the per-record hot path: a
+// scanner allocates itself and its payload buffer, and nothing for each record
+// it decodes.
+func (s *ScannerSuite) TestScanAllocationsDoNotGrowWithRecords() {
+	const records = 1000
+
+	var stream []byte
+	for lsn := uint64(1); lsn <= records; lsn++ {
+		var err error
+		stream, err = Encode(stream, lsn, scannerSetCmd)
+		s.Require().NoError(err)
+	}
+
+	source := bytes.NewReader(stream)
+	allocs := testing.AllocsPerRun(10, func() {
+		source.Reset(stream)
+		scanner := NewScanner(source, defaultMaxRecordBytes)
+		for scanner.Next() {
+		}
+	})
+
+	s.Require().LessOrEqual(allocs, float64(2), "allocations per scan of %d records", records)
+}

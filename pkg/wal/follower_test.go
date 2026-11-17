@@ -50,6 +50,31 @@ func (s *FollowerSuite) collectSnapshot(follower *Follower) (lsns []uint64, payl
 	return lsns, payloads
 }
 
+// TestPanicInLoopReleasesSegment checks that a panic in the consumer's loop
+// body still releases the shared segment handle the follower was reading.
+func (s *FollowerSuite) TestPanicInLoopReleasesSegment() {
+	w := s.appendSequential(3)
+	defer func() { _ = w.Close() }()
+
+	follower, err := w.Follower(0)
+	s.Require().NoError(err)
+	defer func() { _ = follower.Close() }()
+
+	s.Require().Panics(func() {
+		for range follower.Records(context.Background()) {
+			panic("consumer failed")
+		}
+	})
+
+	w.handles.mu.Lock()
+	defer w.handles.mu.Unlock()
+
+	s.Require().NotEmpty(w.handles.byBase)
+	for base, handle := range w.handles.byBase {
+		s.Assert().Zero(handle.refs, "segment %d still held", base)
+	}
+}
+
 func (s *FollowerSuite) TestSnapshotFromBeginning() {
 	w := s.appendSequential(5)
 	defer func() { _ = w.Close() }()

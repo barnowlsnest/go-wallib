@@ -216,3 +216,42 @@ func BenchmarkFollowerTail(b *testing.B) {
 		})
 	}
 }
+
+// benchOlderReadRecords is how many records each older read takes, like a
+// cache miss that fetches a short run of entries.
+const benchOlderReadRecords = 4
+
+// BenchmarkNewReaderOlder measures a cache miss on older data: a reader opened
+// at an LSN spread across the whole log (not the tail), reading a few records
+// and closing. The LSNs step by a prime so they land at different distances
+// from the index entry below them.
+func BenchmarkNewReaderOlder(b *testing.B) {
+	const stride = 997
+
+	for _, layout := range benchLayouts {
+		b.Run(layout.name, func(b *testing.B) {
+			w := openFilledWAL(b, layout.segmentSize)
+			defer func() { _ = w.Close() }()
+
+			span := w.LastLSN() - benchOlderReadRecords
+			next := uint64(0)
+
+			b.ReportAllocs()
+			for b.Loop() {
+				fromLSN := next%span + 1
+				next += stride
+
+				reader, err := w.NewReader(fromLSN)
+				if err != nil {
+					b.Fatal(err)
+				}
+				for want := fromLSN; want < fromLSN+benchOlderReadRecords; want++ {
+					if !reader.Next() || reader.Entry().LSN != want {
+						b.Fatalf("expected LSN %d, err %v", want, reader.Err())
+					}
+				}
+				_ = reader.Close()
+			}
+		})
+	}
+}

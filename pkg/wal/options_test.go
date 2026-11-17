@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -46,6 +47,7 @@ func (s *OptionsSuite) TestDefaults() {
 	s.Require().Positive(o.batchTimeout)
 	s.Require().Positive(o.flushInterval)
 	s.Require().NotNil(o.logger, "logger must default to a non-nil no-op")
+	s.Require().Equal(defaultMaxIdleReadHandles, o.maxIdleReadHandles)
 }
 
 func (s *OptionsSuite) TestOptionsApply() {
@@ -58,6 +60,7 @@ func (s *OptionsSuite) TestOptionsApply() {
 		WithBatchSize(8),
 		WithBatchTimeout(5 * time.Millisecond),
 		WithFlushInterval(50 * time.Millisecond),
+		WithMaxIdleReadHandles(3),
 	} {
 		apply(&o)
 	}
@@ -68,6 +71,20 @@ func (s *OptionsSuite) TestOptionsApply() {
 	s.Require().Equal(8, o.batchSize)
 	s.Require().Equal(5*time.Millisecond, o.batchTimeout)
 	s.Require().Equal(50*time.Millisecond, o.flushInterval)
+	s.Require().Equal(3, o.maxIdleReadHandles)
+}
+
+func (s *OptionsSuite) TestOpenRejectsMaxIdleReadHandlesBelowOne() {
+	for _, count := range []int{0, -1} {
+		dir := filepath.Join(s.T().TempDir(), "wal")
+
+		w, report, err := Open(dir, WithMaxIdleReadHandles(count))
+
+		s.Require().ErrorIs(err, ErrInvalidOption, "count %d", count)
+		s.Require().Nil(w)
+		s.Require().Nil(report)
+		s.Require().NoDirExists(dir, "Open must fail before touching the directory")
+	}
 }
 
 func (s *OptionsSuite) TestWithLoggerStoresAndInvokes() {

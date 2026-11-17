@@ -24,4 +24,8 @@ var (
 	// by Truncate (its position fell below the low-water mark), so the stream has
 	// an unrecoverable gap.
 	ErrTruncated = errors.New("wal: follower position truncated")
+
+	// ErrInvalidOption is returned by Open when an Option was given a value
+	// outside its valid range.
+	ErrInvalidOption = errors.New("wal: invalid option")
 )
