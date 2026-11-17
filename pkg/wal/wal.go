@@ -3,6 +3,7 @@ package wal
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -20,16 +21,22 @@ type openedSeg struct {
 
 // WAL is a Write-Ahead Log. It is safe for concurrent use.
 type WAL struct {
-	closeErr        error
-	active          *segment.Segment
-	closed          chan struct{}
-	requestCh       chan *appendRequest
-	controlCh       chan chan error
-	truncateCh      chan *writerOpRequest
-	cutCh           chan *writerOpRequest
-	subscribeCh     chan wakeup
-	root            *os.Root
-	dir             string
+	closeErr    error
+	active      *segment.Segment
+	closed      chan struct{}
+	requestCh   chan *appendRequest
+	controlCh   chan chan error
+	truncateCh  chan *writerOpRequest
+	cutCh       chan *writerOpRequest
+	subscribeCh chan wakeup
+	root        *os.Root
+	// handles shares read descriptors of segment files between Readers.
+	handles *readHandles
+	dir     string
+	// segmentBaseLSNs lists segment base LSNs, oldest first. Readers share it
+	// without copying (see snapshotLocked), so once readers can exist an element
+	// is never overwritten: change it only by appending, re-slicing, or
+	// assigning a new slice.
 	segmentBaseLSNs []uint64
 	// indexes maps a segment's base LSN to its published index entries, so a
 	// reader can start near its LSN instead of at the segment start. Guarded by
@@ -56,6 +63,11 @@ func Open(dir string, opts ...Option) (w *WAL, report *RecoveryReport, err error
 	resolved := defaultOptions()
 	for _, apply := range opts {
 		apply(&resolved)
+	}
+
+	if resolved.maxIdleReadHandles < 1 {
+		return nil, nil, fmt.Errorf("%w: max idle read handles %d, must be at least 1",
+			ErrInvalidOption, resolved.maxIdleReadHandles)
 	}
 
 	w = &WAL{
@@ -95,6 +107,9 @@ func (w *WAL) recover() (*RecoveryReport, error) {
 	}
 
 	w.root = root
+	// Created here because recovery may already delete segments, which drops
+	// their cached handles.
+	w.handles = newReadHandles(root, w.dir, w.opts.maxIdleReadHandles)
 
 	removedTemps, err := segment.RemoveStaleTempFiles(w.root, w.dir)
 	if err != nil {
@@ -536,6 +551,8 @@ func (w *WAL) Close() error {
 			w.closeErr = errors.Join(w.closeErr, w.active.Close())
 			w.active = nil
 		}
+
+		w.handles.close()
 
 		if w.root != nil {
 			w.closeErr = errors.Join(w.closeErr, w.root.Close())

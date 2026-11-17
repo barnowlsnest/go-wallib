@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 
 	"github.com/barnowlsnest/go-wallib/internal/record"
 	"github.com/barnowlsnest/go-wallib/internal/segment"
@@ -15,59 +17,76 @@ import (
 // Reader is a forward cursor over committed log entries. It is not safe for
 // concurrent use by multiple goroutines.
 type Reader struct {
-	dir          string
-	file         *os.File
-	scanner      *record.Scanner
 	err          error
-	position     readerPosition
-	segmentNames []string
+	handle       *readHandle
+	buffered     *bufio.Reader
+	scanner      *record.Scanner
+	handles      *readHandles
+	segmentBases []uint64
 	current      Entry
+	section      io.SectionReader
+	position     readerPosition
 	index        int
 	fromLSN      uint64
 	endLSN       uint64
 	maxRecord    int
-	// startOffset, when set, is where the first segment opened is read from
-	// instead of just past its header; see resumeAt.
-	startOffset int64
-	// scanBase is the file offset the current scanner started reading from.
-	scanBase int64
-	done     bool
+	startOffset  int64
+	scanBase     int64
+	done         bool
 }
 
-// readerPosition names a segment and the byte offset just past the last record
-// a Reader consumed in it, so a later Reader can continue from there instead of
-// scanning the segment again from its start.
+// readBufferSize matches segment.IndexInterval, so the records between the
+// index entry a Reader starts from and the one it wants usually arrive in one
+// or two reads instead of the sixteen a 4 KiB buffer needs.
+const readBufferSize = segment.IndexInterval
+
+// readBuffers holds read buffers between Readers. A scattered read of older data
+// otherwise allocates a fresh buffer per segment it enters. Pooling is safe
+// because the scanner copies each payload into its own buffer, so no Entry
+// points into a read buffer.
+var readBuffers = sync.Pool{
+	New: func() any { return bufio.NewReaderSize(nil, readBufferSize) },
+}
+
+// readerPosition names a segment by base LSN and the byte offset just past the
+// last record a Reader consumed in it, so a later Reader can continue from there
+// instead of scanning the segment again from its start. The zero value names no
+// position; a set one is never below the segment header.
 type readerPosition struct {
-	segmentName string
-	offset      int64
+	baseLSN uint64
+	offset  int64
 }
 
-// readerSnapshot captures the segment file names, the last committed LSN, and the
+// isSet reports whether the position names a segment.
+func (p readerPosition) isSet() bool { return p.offset > 0 }
+
+// readerSnapshot captures the segment base LSNs, the last committed LSN, and the
 // first available LSN under the read lock, for constructing a point-in-time reader.
-func (w *WAL) readerSnapshot() (segmentNames []string, endLSN, firstLSN uint64) {
+func (w *WAL) readerSnapshot() (segmentBases []uint64, endLSN, firstLSN uint64) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
 	return w.snapshotLocked()
 }
 
-// snapshotLocked is readerSnapshot for a caller holding mu.
-func (w *WAL) snapshotLocked() (segmentNames []string, endLSN, firstLSN uint64) {
-	segmentNames = make([]string, len(w.segmentBaseLSNs))
-	for i, baseLSN := range w.segmentBaseLSNs {
-		segmentNames[i] = segment.Name(baseLSN)
-	}
+// snapshotLocked is readerSnapshot for a caller holding mu. The base LSNs are
+// shared with the WAL instead of copied, which would cost every new Reader an
+// allocation and a copy that grow with the number of segments. That is safe
+// because the writer never overwrites an element of segmentBaseLSNs (see the
+// field), and capping the capacity keeps the Reader from appending into it.
+func (w *WAL) snapshotLocked() (segmentBases []uint64, endLSN, firstLSN uint64) {
+	count := len(w.segmentBaseLSNs)
 
-	return segmentNames, w.lastLSN, w.firstLSN
+	return w.segmentBaseLSNs[:count:count], w.lastLSN, w.firstLSN
 }
 
 // newReaderFrom builds a Reader over a captured snapshot, yielding entries with
 // LSN in [fromLSN, endLSN]. It is the shared core of NewReader and the Follower.
-func newReaderFrom(dir string, segmentNames []string, fromLSN, endLSN uint64, maxRecord int) *Reader {
+func newReaderFrom(handles *readHandles, segmentBases []uint64, fromLSN, endLSN uint64, maxRecord int) *Reader {
 	return &Reader{
-		dir:          dir,
-		segmentNames: segmentNames,
-		index:        startIndex(segmentNames, fromLSN),
+		handles:      handles,
+		segmentBases: segmentBases,
+		index:        startIndex(segmentBases, fromLSN),
 		fromLSN:      fromLSN,
 		endLSN:       endLSN,
 		maxRecord:    maxRecord,
@@ -84,11 +103,11 @@ func (w *WAL) NewReader(fromLSN uint64) (*Reader, error) {
 	}
 
 	w.mu.RLock()
-	segmentNames, endLSN, _ := w.snapshotLocked()
+	segmentBases, endLSN, _ := w.snapshotLocked()
 	start := w.indexedPositionLocked(fromLSN)
 	w.mu.RUnlock()
 
-	reader := newReaderFrom(w.dir, segmentNames, fromLSN, endLSN, w.opts.maxRecordSize)
+	reader := newReaderFrom(w.handles, segmentBases, fromLSN, endLSN, w.opts.maxRecordSize)
 	reader.resumeAt(start)
 
 	return reader, nil
@@ -117,7 +136,7 @@ func (w *WAL) indexedPositionLocked(fromLSN uint64) readerPosition {
 		return readerPosition{}
 	}
 
-	return readerPosition{segmentName: segment.Name(baseLSN), offset: offset}
+	return readerPosition{baseLSN: baseLSN, offset: offset}
 }
 
 // Next advances to the next entry. It returns false at the end of the snapshot
@@ -179,14 +198,14 @@ func (r *Reader) accept(scanned record.Record) (Entry, bool) {
 // CutOffset into a seg-<cut> the snapshot does not name, so the remaining
 // segments are re-listed from the directory rather than trusted.
 func (r *Reader) openNext() bool {
-	for r.index < len(r.segmentNames) {
-		name := r.segmentNames[r.index]
+	for r.index < len(r.segmentBases) {
+		baseLSN := r.segmentBases[r.index]
 		r.index++
 
-		file, err := os.OpenInRoot(r.dir, name)
+		handle, err := r.handles.acquire(baseLSN)
 		if err != nil {
 			if os.IsNotExist(err) {
-				if err := r.relistAfter(name); err != nil {
+				if err := r.relistAfter(baseLSN); err != nil {
 					r.fail(err)
 
 					return false
@@ -205,17 +224,13 @@ func (r *Reader) openNext() bool {
 			offset, r.startOffset = r.startOffset, 0
 		}
 
-		if _, err := file.Seek(offset, io.SeekStart); err != nil {
-			_ = file.Close()
-			r.fail(err)
-
-			return false
-		}
-
-		r.file = file
-		r.scanner = record.NewScanner(bufio.NewReader(file), r.maxRecord)
+		r.handle = handle
+		r.section = *io.NewSectionReader(handle.file, offset, math.MaxInt64-offset)
+		r.buffered, _ = readBuffers.Get().(*bufio.Reader)
+		r.buffered.Reset(&r.section)
+		r.scanner = record.NewScanner(r.buffered, r.maxRecord)
 		r.scanBase = offset
-		r.position = readerPosition{segmentName: name, offset: offset}
+		r.position = readerPosition{baseLSN: baseLSN, offset: offset}
 
 		return true
 	}
@@ -228,23 +243,20 @@ func (r *Reader) openNext() bool {
 // relistAfter replaces the remaining snapshot with every segment now on disk
 // whose base LSN is above the missing one. A cut creates seg-<cut> durably before
 // deleting the segment it replaces, so its records are always found here.
-func (r *Reader) relistAfter(missing string) error {
-	missingBase, _ := segment.ParseBaseLSN(missing)
-
-	paths, err := segment.List(r.dir)
+func (r *Reader) relistAfter(missingBase uint64) error {
+	paths, err := segment.List(r.handles.dir)
 	if err != nil {
 		return err
 	}
 
-	remaining := make([]string, 0, len(paths))
+	remaining := make([]uint64, 0, len(paths))
 	for _, path := range paths {
-		name := filepath.Base(path)
-		if base, _ := segment.ParseBaseLSN(name); base > missingBase {
-			remaining = append(remaining, name)
+		if base, _ := segment.ParseBaseLSN(filepath.Base(path)); base > missingBase {
+			remaining = append(remaining, base)
 		}
 	}
 
-	r.segmentNames = remaining
+	r.segmentBases = remaining
 	r.index = startIndex(remaining, r.fromLSN)
 	r.startOffset = 0
 
@@ -256,12 +268,8 @@ func (r *Reader) relistAfter(missing string) error {
 // holds no LSN at or above the next segment's base (a cut's overlap copy lives in
 // that next segment too), so every segment before this index can be skipped
 // without reading it.
-func startIndex(segmentNames []string, fromLSN uint64) int {
-	above := sort.Search(len(segmentNames), func(i int) bool {
-		base, _ := segment.ParseBaseLSN(segmentNames[i])
-
-		return base > fromLSN
-	})
+func startIndex(segmentBases []uint64, fromLSN uint64) int {
+	above := sort.Search(len(segmentBases), func(i int) bool { return segmentBases[i] > fromLSN })
 
 	return max(above-1, 0)
 }
@@ -273,11 +281,11 @@ func startIndex(segmentNames []string, fromLSN uint64) int {
 // other case, including a segment the snapshot no longer names, the start chosen
 // from fromLSN is kept.
 func (r *Reader) resumeAt(position readerPosition) {
-	if r.done || position.segmentName == "" || r.index >= len(r.segmentNames) {
+	if r.done || !position.isSet() || r.index >= len(r.segmentBases) {
 		return
 	}
 
-	if r.segmentNames[r.index] == position.segmentName {
+	if r.segmentBases[r.index] == position.baseLSN {
 		r.startOffset = position.offset
 	}
 }
@@ -287,11 +295,19 @@ func (r *Reader) resumeAt(position readerPosition) {
 // empty if the Reader never opened a segment.
 func (r *Reader) lastPosition() readerPosition { return r.position }
 
-// closeCurrent closes the open segment so the next one can be read.
+// closeCurrent releases the open segment so the next one can be read.
 func (r *Reader) closeCurrent() {
-	if r.file != nil {
-		_ = r.file.Close()
-		r.file = nil
+	if r.handle != nil {
+		r.handles.release(r.handle)
+		r.handle = nil
+	}
+
+	if r.buffered != nil {
+		// Drop the reference to the section so a pooled buffer does not keep
+		// this Reader alive.
+		r.buffered.Reset(nil)
+		readBuffers.Put(r.buffered)
+		r.buffered = nil
 	}
 
 	r.scanner = nil

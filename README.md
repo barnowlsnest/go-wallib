@@ -228,8 +228,15 @@ wal.WithBatchSize(256)                        // max appends coalesced per commi
 wal.WithBatchTimeout(2 * time.Millisecond)    // group-commit linger (SyncBatched)
 wal.WithFlushInterval(100 * time.Millisecond) // background fsync period (SyncInterval)
 wal.WithMaxOperationTimeout(30 * time.Second) // bound for Sync, Truncate, CutOffset (default 30s)
+wal.WithMaxIdleReadHandles(64)                // segment files kept open for readers between reads (default 64)
 wal.WithLogger(logger)                        // structured logger (default: no-op)
 ```
+
+Readers and followers share one open file per segment. When no reader is using
+a segment, its file stays open for the next one, up to `WithMaxIdleReadHandles`
+files; past that, the least recently used one is closed. Files in use don't
+count toward the limit and are never closed early. `Open` returns
+`ErrInvalidOption` for a value below 1.
 
 To control the wait per call instead, use `SyncContext`, `TruncateContext`, and
 `CutOffsetContext`, which take a caller-supplied `context.Context`.

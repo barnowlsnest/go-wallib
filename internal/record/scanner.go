@@ -36,6 +36,10 @@ type Scanner struct {
 	payloadBuf []byte
 	// current holds the most-recently decoded record.
 	current Record
+	// header holds the record header being read. A local array would escape to
+	// the heap once per record, because io.ReadFull takes it through the
+	// io.Reader interface; kept here it lives in the Scanner's own allocation.
+	header [HeaderSize]byte
 
 	maxRecBytes int
 	// validBytes is the sum of HeaderSize+Length for all fully-valid records seen
@@ -61,8 +65,8 @@ func (s *Scanner) Next() bool {
 		return false
 	}
 
-	var header [HeaderSize]byte
-	if readErr := s.readHeader(header[:]); readErr != nil {
+	header := s.header[:]
+	if readErr := s.readHeader(header); readErr != nil {
 		if !errors.Is(readErr, io.EOF) {
 			s.firstErr = readErr
 		}
@@ -70,23 +74,26 @@ func (s *Scanner) Next() bool {
 		return false
 	}
 
+	storedCRC := binary.LittleEndian.Uint32(header[0:4])
 	payloadLen := binary.LittleEndian.Uint32(header[4:8])
+	lsn := binary.LittleEndian.Uint64(header[8:16])
+
 	if int(payloadLen) > s.maxRecBytes {
 		s.firstErr = ErrTooLarge
+
 		return false
 	}
-
-	lsn := binary.LittleEndian.Uint64(header[8:16])
-	storedCRC := binary.LittleEndian.Uint32(header[0:4])
 
 	payload, payloadErr := s.readPayload(int(payloadLen))
 	if payloadErr != nil {
 		s.firstErr = payloadErr
+
 		return false
 	}
 
 	if !crcMatches(storedCRC, header[4:16], payload) {
 		s.firstErr = ErrCorrupt
+
 		return false
 	}
 

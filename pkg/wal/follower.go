@@ -81,34 +81,35 @@ const (
 // scanBatch reads one snapshot's worth of records into yield, updating *highWater
 // and *delivered. It returns a scanResult indicating what the caller should do next.
 func (f *Follower) scanBatch(
-	segmentNames []string,
+	segmentBases []uint64,
 	endLSN uint64,
 	highWater *uint64,
 	delivered *bool,
 	yield func(uint64, []byte) bool,
 ) (result scanResult) {
 	expectedLSN := *highWater + 1
-	reader := newReaderFrom(f.wal.dir, segmentNames, expectedLSN, endLSN, f.maxRecord)
+	reader := newReaderFrom(f.wal.handles, segmentBases, expectedLSN, endLSN, f.maxRecord)
 	// The first scan has no earlier position to resume from, so it starts at
 	// the index entry nearest its LSN instead of the segment start.
 	start := f.resume
-	if start.segmentName == "" {
+	if !start.isSet() {
 		start = f.wal.indexedPosition(expectedLSN)
 	}
 	reader.resumeAt(start)
 
 	defer func() {
-		if position := reader.lastPosition(); position.segmentName != "" {
+		if position := reader.lastPosition(); position.isSet() {
 			f.resume = position
 		}
 	}()
+	// Deferred so a panic in yield still releases the shared segment handle,
+	// which otherwise stays marked in use until the WAL closes.
+	defer func() { _ = reader.Close() }()
 
 	for reader.Next() {
 		entry := reader.Entry()
 
 		if entry.LSN > expectedLSN && (*delivered || f.fromLSN > 0) {
-			_ = reader.Close()
-
 			return scanTruncated
 		}
 
@@ -117,14 +118,11 @@ func (f *Follower) scanBatch(
 		*delivered = true
 
 		if !yield(entry.LSN, bytes.Clone(entry.Payload)) {
-			_ = reader.Close()
-
 			return scanStop
 		}
 	}
 
 	scanErr := reader.Err()
-	_ = reader.Close()
 
 	if scanErr != nil {
 		f.err = scanErr
@@ -161,7 +159,7 @@ func (f *Follower) Records(ctx context.Context) iter.Seq2[uint64, []byte] {
 
 		delivered := false
 		for {
-			segmentNames, tail, firstLSN := f.wal.readerSnapshot()
+			segmentBases, tail, firstLSN := f.wal.readerSnapshot()
 
 			if (delivered || f.fromLSN > 0) && highWater+1 < firstLSN {
 				f.err = ErrTruncated
@@ -174,7 +172,7 @@ func (f *Follower) Records(ctx context.Context) iter.Seq2[uint64, []byte] {
 				endLSN = f.endLSN
 			}
 
-			switch f.scanBatch(segmentNames, endLSN, &highWater, &delivered, yield) {
+			switch f.scanBatch(segmentBases, endLSN, &highWater, &delivered, yield) {
 			case scanStop:
 				return
 			case scanTruncated:
